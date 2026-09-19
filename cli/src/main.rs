@@ -329,6 +329,7 @@ async fn wizard_state() -> Result<String, (StatusCode, String)> {
     }
     let v = serde_json::json!({
         "position": cfg.position,
+        "group_id": cfg.group_id,
         "wizard_done": cfg.wizard_done,
         "tunnel": cfg.tunnel,
         "receive_dir": cfg.receive_dir,

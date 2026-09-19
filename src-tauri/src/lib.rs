@@ -296,12 +296,18 @@ async fn wizard_finish(
     tunnel_enabled: bool,
     relay: String,
     device_id: String,
+    group_id: String,
     shared_secret: String,
     known_tunnel_devices: String,
     receive_dir: String,
 ) -> Result<(), String> {
+    let group_id = group_id.trim().to_string();
+    if tunnel_enabled && (group_id.len() != 6 || !group_id.chars().all(|c| c.is_ascii_digit())) {
+        return Err("group id must be 6 digits".into());
+    }
     let mut cfg = get_cfg();
     cfg.position = position;
+    cfg.group_id = group_id;
     cfg.tunnel.enabled = tunnel_enabled;
     cfg.tunnel.relay = relay;
     cfg.tunnel.device_id = device_id;

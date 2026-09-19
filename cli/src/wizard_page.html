@@ -82,6 +82,14 @@
     <div style="margin-top:12px" class="dim">This device's identity:
       <b id="devid" style="color:#64d2ff;font-family:ui-monospace"></b></div>
     <div style="margin-top:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">Group ID (6 digits)</div>
+      <input type="text" id="groupId" maxlength="6" inputmode="numeric"
+        placeholder="e.g. 482913 — the same number on every device that should reach each other" />
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        Devices sharing this Group ID (and the passphrase) see each other and can send files through the tunnel.
+      </div>
+    </div>
+    <div style="margin-top:12px">
       <input type="password" id="pairSecret" placeholder="Pairing passphrase (same on trusted devices)" autocomplete="off" />
       <div class="dim" style="font-size:11px;margin-top:4px">Optional but recommended: encrypts tunnel file contents end-to-end. It is never sent to the relay.</div>
     </div>
@@ -156,6 +164,8 @@
     $('tunEn').checked = st.tunnel.enabled;
     $('receiveDir').value = st.receive_dir || '';
     $('pairSecret').value = st.tunnel.shared_secret || '';
+    $('groupId').value = st.group_id || '';
+    $('groupId').oninput = (e) => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); };
     $('tunnelPeers').value = (st.known_tunnel_devices || []).join(', ');
     tunnelEnabled = st.tunnel.enabled;
     position = st.position;
@@ -207,12 +217,17 @@
       $('r5').innerHTML = '<span class="bad">Enter the same pairing passphrase on every trusted tunnel device.</span>';
       return;
     }
+    if ($('tunEn').checked && !/^\d{6}$/.test($('groupId').value)) {
+      $('r5').innerHTML = '<span class="bad">Enter the 6-digit Group ID shared by your devices.</span>';
+      return;
+    }
     tunnelEnabled = $('tunEn').checked;
     const res = await fetch('/api/wizard/finish', {
       method: 'POST',
       body: JSON.stringify({
         position, tunnel_enabled: tunnelEnabled,
         relay: $('relay').value.trim(), device_id: $('devid').textContent,
+        group_id: $('groupId').value,
         receive_dir: $('receiveDir').value.trim(), shared_secret: $('pairSecret').value,
         tunnel_peers: $('tunnelPeers').value.trim()
       })

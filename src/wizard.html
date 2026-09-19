@@ -163,24 +163,27 @@
   const { invoke } = window.__TAURI__.core;
   const dbg = (m) => invoke('ui_debug', { msg: m }).catch(() => {});
 
+  const $ = (id) => document.getElementById(id);
+  const cfg = await invoke('get_config');   // must come before `state` reads it
+
   let cur = 1;
   const state = {
     net: null,          // {ip, port_ok}
-    tunnel: { enabled: false, relay: 'wss://riki-api.online/ws', ok: null, skipped: false },
-    position: 'right',
+    tunnel: { enabled: !!cfg.tunnel.enabled, relay: cfg.tunnel.relay, ok: null, skipped: false },
+    position: cfg.position,
     group: cfg.group_id || '',
   };
-
-  const $ = (id) => document.getElementById(id);
-  const cfg = await invoke('get_config');
-  state.tunnel.relay = cfg.tunnel.relay;
-  state.position = cfg.position;
   $('relay').value = cfg.tunnel.relay;
+  $('groupId').value = state.group;
+  $('groupId').oninput = (e) => {
+    e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
+    state.group = e.target.value;
+  };
   $('receiveDir').value = cfg.receive_dir || '';
   $('devid').textContent = cfg.tunnel.device_id;
   $('pairSecret').value = cfg.tunnel.shared_secret || '';
   $('tunnelPeers').value = (cfg.known_tunnel_devices || []).join(', ');
-  $('tunEn').checked = false;
+  $('tunEn').checked = state.tunnel.enabled;
   document.querySelectorAll('.poscard').forEach(c =>
     c.classList.toggle('sel', c.dataset.side === cfg.position));
 
@@ -267,11 +270,15 @@
       if (state.tunnel.enabled && !$('pairSecret').value.trim()) {
         throw new Error('enter the same pairing passphrase on every trusted tunnel device');
       }
+      if (state.tunnel.enabled && !/^\d{6}$/.test(state.group)) {
+        throw new Error('enter the 6-digit Group ID shared by your devices (step 2)');
+      }
       await invoke('wizard_finish', {
         position: state.position,
         tunnelEnabled: state.tunnel.enabled,
         relay: state.tunnel.relay,
         deviceId: cfg.tunnel.device_id,
+        groupId: state.group,
         sharedSecret: $('pairSecret').value,
         knownTunnelDevices: $('tunnelPeers').value,
         receiveDir: $('receiveDir').value.trim(),
