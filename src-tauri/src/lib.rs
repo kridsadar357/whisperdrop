@@ -677,8 +677,9 @@ pub fn run() {
             activity::write(format!("started; tunnel={}", cfg.tunnel.enabled));
 
             // ---- receiver server + mDNS ----
+            let srv_handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                let port = server::start_receiver_server().await;
+                let port = server::start_receiver_server(srv_handle).await;
                 let hostname = hostname();
                 mdns::start(&hostname, port);
             });

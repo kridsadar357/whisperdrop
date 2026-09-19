@@ -241,7 +241,7 @@
       <div class="head">
         <div class="mark">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M12 19V6M6 12l6-6 6 6"/>
+            <path id="markPath" d="M12 19V6M6 12l6-6 6 6"/>
           </svg>
         </div>
         <div>
@@ -251,6 +251,7 @@
       </div>
       <div class="list" id="peerList"></div>
       <div class="list" id="progressList" style="display:none"></div>
+      <div class="list" id="recvList" style="display:none"></div>
       <div id="approve">
         <div class="who"><div class="avatar" id="apAvatar"></div><div><div class="name" id="apName"></div><div class="meta" id="apMeta"></div></div></div>
         <div class="note">Approving lets this device see your group, receive your files and send you files. Only approve devices you recognise.</div>
@@ -284,6 +285,8 @@
     const win = getCurrentWindow();
     const $ = (id) => document.getElementById(id);
     const panelTitle = $('panelTitle'), panelSubtitle = $('panelSubtitle');
+    const UP_ARROW = 'M12 19V6M6 12l6-6 6 6', DOWN_ARROW = 'M12 5v13M6 12l6 6 6-6';
+    const setMark = (dir) => { const el = $('markPath'); if (el) el.setAttribute('d', dir === 'down' ? DOWN_ARROW : UP_ARROW); };
     const peerListEl = $('peerList'), progressListEl = $('progressList'), peerFoot = $('peerFoot');
 
     /* ---------- config ---------- */
@@ -323,6 +326,8 @@
     async function openPeerPicker(files) {
       pendingFiles = files || [];
       $('approve').style.display = 'none'; showingRequest = null;
+      recvListEl.style.display = 'none';
+      setMark('up');
       peerListEl.style.display = 'flex';
       progressListEl.style.display = 'none';
       progressListEl.innerHTML = '';
@@ -524,6 +529,71 @@
       x.el.querySelector('.fmeta').textContent = `${fmtBytes(sent)} / ${fmtBytes(total)}`;
     });
     await listen('transfer-done', (e) => finishRow(e.payload.transferId, e.payload.ok, e.payload.error));
+
+    /* ---------- incoming transfers (this device is receiving) ---------- */
+    const recvListEl = $('recvList');
+    const incoming = new Map(); // transferId -> { el }
+    let recvActive = 0;
+
+    function openReceiving() {
+      // don't steal a device picker or an active send; queue silently otherwise
+      if (mode === 'panel' && (peerListEl.style.display !== 'none' || progressListEl.style.display !== 'none' || showingRequest)) return;
+      peerListEl.style.display = 'none';
+      progressListEl.style.display = 'none';
+      peerFoot.style.display = 'none';
+      $('approve').style.display = 'none';
+      recvListEl.style.display = 'flex';
+      setMark('down');
+      panelTitle.textContent = 'Receiving';
+      if (mode !== 'panel') setMode('panel');
+    }
+
+    await listen('incoming-begin', (e) => {
+      const { transferId, filename, total, from } = e.payload;
+      recvActive++;
+      panelSubtitle.textContent = from ? `from ${from}` : 'incoming';
+      const el = document.createElement('div');
+      el.className = 'xfer';
+      el.innerHTML =
+        `<div class="r1"><div class="fico">${fileGlyph(filename)}</div>` +
+        `<div style="flex:1;min-width:0"><div class="fname" title="${escapeHtml(filename)}">${escapeHtml(filename)}</div><div class="fmeta">receiving…</div></div>` +
+        `<div class="pct">0%</div></div>` +
+        `<div class="bar${total ? '' : ' indet'}"><i></i></div>`;
+      recvListEl.prepend(el);
+      incoming.set(transferId, { el, total });
+      openReceiving();
+    });
+    await listen('incoming-progress', (e) => {
+      const { transferId, sent, total } = e.payload;
+      const x = incoming.get(transferId); if (!x) return;
+      const t = total || x.total || 0;
+      if (t) {
+        const pct = Math.min(100, Math.floor((sent / t) * 100));
+        x.el.querySelector('.bar').classList.remove('indet');
+        x.el.querySelector('.pct').textContent = pct + '%';
+        x.el.querySelector('.bar > i').style.width = pct + '%';
+      } else {
+        x.el.querySelector('.pct').textContent = fmtBytes(sent);
+      }
+      x.el.querySelector('.fmeta').textContent = t ? `${fmtBytes(sent)} / ${fmtBytes(t)}` : `${fmtBytes(sent)} received`;
+    });
+    await listen('incoming-done', (e) => {
+      const { transferId, ok, filename } = e.payload;
+      const x = incoming.get(transferId); if (!x) return;
+      x.el.classList.add(ok ? 'done' : 'fail');
+      x.el.querySelector('.bar').classList.remove('indet');
+      x.el.querySelector('.bar > i').style.width = '100%';
+      x.el.querySelector('.pct').textContent = ok ? '✓' : '✕';
+      x.el.querySelector('.fmeta').textContent = ok ? 'received' : 'failed';
+      incoming.delete(transferId);
+      recvActive = Math.max(0, recvActive - 1);
+      panelTitle.textContent = ok ? 'Received ✓' : 'Receive failed';
+      if (recvActive === 0) {
+        setTimeout(() => {
+          if (mode === 'panel' && recvListEl.style.display !== 'none') { recvListEl.innerHTML = ''; showStrip(); }
+        }, ok ? 2600 : 6000);
+      }
+    });
 
     /* ---------- join requests (this device is the group head) ---------- */
     const joinQueue = [];

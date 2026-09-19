@@ -122,6 +122,9 @@ static IN_FAILED: AtomicBool = AtomicBool::new(false);
 static IN_ENCRYPTED: AtomicBool = AtomicBool::new(false);
 static IN_NONCE: Mutex<String> = Mutex::new(String::new());
 static IN_REPLY_TO: Mutex<String> = Mutex::new(String::new());
+static IN_ID: Mutex<String> = Mutex::new(String::new());
+static IN_SEQ: AtomicU64 = AtomicU64::new(1);
+static IN_LAST_EMIT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 /// Sender of the transfer currently being written (one at a time).
 static IN_FROM: Mutex<String> = Mutex::new(String::new());
 
@@ -692,7 +695,11 @@ async fn handle_frame(
             dir.push(format!(".{name}.part"));
             *IN_FILE.lock().unwrap() = Some(dir.clone());
             tokio::fs::write(&dir, b"").await.ok();
-            crate::tray::notify(app, "WhisperDrop", &format!("Incoming: {name} via tunnel"));
+            let id = format!("tun-{}", IN_SEQ.fetch_add(1, Ordering::Relaxed));
+            *IN_ID.lock().unwrap() = id.clone();
+            *IN_LAST_EMIT.lock().unwrap() = None;
+            let peer = TUNNEL_MEMBERS.lock().unwrap().iter().find(|m| m.device_id == *IN_FROM.lock().unwrap()).map(|m| m.name.clone()).filter(|n| !n.is_empty()).unwrap_or_else(|| "tunnel".into());
+            crate::server::emit_incoming_begin(app, &id, &name, IN_TOTAL.load(Ordering::Relaxed), &peer);
         }
         "chunk" => {
             let b64data = v["b64"].as_str().unwrap_or("");
@@ -727,6 +734,17 @@ async fn handle_frame(
             }
             IN_SENT.fetch_add(bytes.len() as u64, Ordering::Relaxed);
             part_write(&bytes).await;
+            let due = {
+                let mut last = IN_LAST_EMIT.lock().unwrap();
+                if last.map(|t| t.elapsed() >= std::time::Duration::from_millis(80)).unwrap_or(true) {
+                    *last = Some(std::time::Instant::now());
+                    true
+                } else { false }
+            };
+            if due {
+                let id = IN_ID.lock().unwrap().clone();
+                crate::server::emit_incoming_progress(app, &id, IN_SENT.load(Ordering::Relaxed), IN_TOTAL.load(Ordering::Relaxed));
+            }
         }
         "end" => {
             part_close().await;
@@ -734,8 +752,10 @@ async fn handle_frame(
             let failed = IN_FAILED.swap(false, Ordering::Relaxed);
             let part_opt = IN_FILE.lock().unwrap().clone();
             if let Some(part) = part_opt {
+                let id = IN_ID.lock().unwrap().clone();
                 if failed {
                     let _ = tokio::fs::remove_file(&part).await;
+                    crate::server::emit_incoming_done(app, &id, false, &newname);
                     crate::tray::notify(app, "WhisperDrop", "Incoming transfer failed — passphrase mismatch");
                 } else if let Some(dir) = part.parent() {
                     let mut finalp = dir.join(&newname);
@@ -746,6 +766,8 @@ async fn handle_frame(
                     }
                     tokio::fs::rename(&part, &finalp).await.ok();
                     println!("✓ tunnel received -> {}", finalp.display());
+                    crate::server::emit_incoming_progress(app, &id, IN_SENT.load(Ordering::Relaxed), IN_SENT.load(Ordering::Relaxed));
+                    crate::server::emit_incoming_done(app, &id, true, &newname);
                     crate::tray::notify(app, "WhisperDrop", &format!("Received {newname} via tunnel"));
                     let reply_to = IN_REPLY_TO.lock().unwrap().clone();
                     if !reply_to.is_empty() {

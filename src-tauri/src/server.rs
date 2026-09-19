@@ -1,13 +1,37 @@
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Multipart},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Multipart, State},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Router,
 };
 use futures_util::StreamExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tauri::{AppHandle, Emitter};
 use tokio::io::AsyncWriteExt;
+
+static XFER_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Announce an incoming transfer to the drop-zone windows.
+pub fn emit_incoming_begin(app: &AppHandle, id: &str, filename: &str, total: u64, from: &str) {
+    let _ = app.emit(
+        "incoming-begin",
+        serde_json::json!({"transferId": id, "filename": filename, "total": total, "from": from}),
+    );
+}
+pub fn emit_incoming_progress(app: &AppHandle, id: &str, sent: u64, total: u64) {
+    let _ = app.emit(
+        "incoming-progress",
+        serde_json::json!({"transferId": id, "sent": sent, "total": total}),
+    );
+}
+pub fn emit_incoming_done(app: &AppHandle, id: &str, ok: bool, filename: &str) {
+    let _ = app.emit(
+        "incoming-done",
+        serde_json::json!({"transferId": id, "ok": ok, "filename": filename}),
+    );
+}
 
 pub const DEFAULT_PORT: u16 = 51730;
 pub const RECEIVE_DIR_NAME: &str = "BridgeReceived";
@@ -62,7 +86,9 @@ fn unique_path(dir: &std::path::Path, filename: &str) -> PathBuf {
 
 /// POST /upload?filename=... — body is the raw file byte stream, chunked.
 async fn upload(
+    State(app): State<AppHandle>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
     stream: Body,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     let filename = sanitize_filename(
@@ -79,26 +105,48 @@ async fn upload(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let dest = unique_path(&dir, &filename);
 
-    let mut file = tokio::fs::File::create(&dest)
+    let total = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let id = format!("in-{}", XFER_SEQ.fetch_add(1, Ordering::Relaxed));
+    let peer = params.get("from").cloned().unwrap_or_else(|| "LAN".into());
+    emit_incoming_begin(&app, &id, &filename, total, &peer);
+
+    let file = tokio::fs::File::create(&dest)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, file);
     let mut stream = stream.into_data_stream();
     let mut written: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        written += chunk.len() as u64;
+    let mut last = std::time::Instant::now();
+    let result: Result<(), String> = async {
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            file.write_all(&chunk).await.map_err(|e| e.to_string())?;
+            written += chunk.len() as u64;
+            if last.elapsed() >= std::time::Duration::from_millis(80) {
+                last = std::time::Instant::now();
+                emit_incoming_progress(&app, &id, written, total);
+            }
+        }
+        file.flush().await.map_err(|e| e.to_string())?;
+        Ok(())
     }
-    file.flush()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .await;
+    if let Err(e) = result {
+        emit_incoming_done(&app, &id, false, &filename);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, e));
+    }
+    emit_incoming_progress(&app, &id, written, total.max(written));
+    emit_incoming_done(&app, &id, true, &filename);
     eprintln!("[server] received {written} bytes -> {}", dest.display());
     crate::activity::write(format!(
         "received {filename} ({written} bytes) -> {}",
         dest.display()
     ));
+    crate::tray::notify(&app, "WhisperDrop", &format!("Received {filename}"));
     Ok((
         StatusCode::OK,
         dest.file_name()
@@ -165,14 +213,15 @@ async fn health() -> &'static str {
 
 /// Background receiver server; falls forward from DEFAULT_PORT on collision
 /// (a second instance on the same machine gets the next free port).
-pub async fn start_receiver_server() -> u16 {
+pub async fn start_receiver_server(handle: AppHandle) -> u16 {
     for port in DEFAULT_PORT..DEFAULT_PORT + 20 {
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         let app = Router::new()
             .route("/upload", post(upload))
             .route("/upload-multipart", post(upload_multipart))
             .route("/health", get(health))
-            .layer(DefaultBodyLimit::disable());
+            .layer(DefaultBodyLimit::disable())
+            .with_state(handle.clone());
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
                 eprintln!("[server] listening on {addr}");
