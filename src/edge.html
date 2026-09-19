@@ -305,14 +305,6 @@
     let pendingFiles = [];
     let savedManualPeer = null; // {name, ip, port} verified via check_peer
 
-    // Shown when nothing real is reachable so the flow can be demoed
-    // end-to-end; transfers to them are pure UI animation.
-    const DEMO_PEERS = [
-      { name: 'iPhone 15 Pro', ip: 'simulated', port: 0, demo: true },
-      { name: 'MacBook Air', ip: 'simulated', port: 0, demo: true },
-      { name: 'DESKTOP-9F2K', ip: 'simulated', port: 0, demo: true },
-    ];
-
     async function openPeerPicker(files) {
       pendingFiles = files || [];
       peerListEl.style.display = 'flex';
@@ -329,11 +321,8 @@
       catch (e) { dbg('get_online_peers failed ' + e); }
       if (mode !== 'panel') return; // closed while querying
 
-      let demo = false;
-      if (!peers.length && !GROUP && !savedManualPeer) { peers = DEMO_PEERS; demo = true; }
-
       panelSubtitle.textContent = !pendingFiles.length
-        ? (demo ? 'Demo devices · drop a file on the edge to send' : 'Drop a file on the edge to send')
+        ? 'Drop a file on the edge to send'
         : pendingFiles.length === 1
           ? `“${basename(pendingFiles[0])}”`
           : `${pendingFiles.length} files`;
@@ -345,8 +334,7 @@
           () => { if (pendingFiles.length) startTransfer(m); }));
       }
       for (const p of peers) {
-        peerListEl.appendChild(row(avatar(p.name), p.name,
-          p.demo ? 'demo device · simulated' : `${p.ip}:${p.port}`, p.demo ? 'DEMO' : 'LAN',
+        peerListEl.appendChild(row(avatar(p.name), p.name, `${p.ip}:${p.port}`, 'LAN',
           () => { if (pendingFiles.length) startTransfer(p); }));
       }
       if (GROUP) {
@@ -418,7 +406,7 @@
         status.textContent = 'checking…'; status.style.color = '';
         try {
           const port = await invoke('check_peer', { targetIp: ip });
-          savedManualPeer = { name: ip, ip, port, demo: false };
+          savedManualPeer = { name: ip, ip, port };
           el.replaceWith(row(avatar(ip, 'ok'), ip, `receiver found on port ${port}`, 'IP',
             () => { if (pendingFiles.length) startTransfer(savedManualPeer); }));
           if (pendingFiles.length) startTransfer(savedManualPeer);
@@ -435,14 +423,14 @@
     const xfers = new Map();
 
     async function startTransfer(peer) {
-      dbg(`start-transfer ${peer.name} demo=${!!peer.demo} files=${pendingFiles.length}`);
+      dbg(`start-transfer ${peer.name} files=${pendingFiles.length}`);
       peerListEl.style.display = 'none';
       peerFoot.style.display = 'none';
       progressListEl.style.display = 'flex';
       progressListEl.innerHTML = '';
       xfers.clear();
-      panelTitle.textContent = peer.demo ? `Simulating → ${peer.name}` : `Sending to ${peer.name}`;
-      panelSubtitle.textContent = peer.tunnel ? 'encrypted tunnel' : (peer.demo ? 'demo transfer' : peer.ip);
+      panelTitle.textContent = `Sending to ${peer.name}`;
+      panelSubtitle.textContent = peer.tunnel ? 'encrypted tunnel' : peer.ip;
 
       const queue = [];
       for (const fp of pendingFiles) {
@@ -460,10 +448,7 @@
         queue.push(async () => {
           el.querySelector('.fmeta').textContent = 'sending…';
           try {
-            if (peer.demo) {
-              simulateRow(id);
-              await new Promise(r => setTimeout(r, 4700));
-            } else if (peer.tunnel) {
+            if (peer.tunnel) {
               await invoke('send_file_tunnel', { transferId: id, target: peer.target, filePath: fp });
               finishRow(id, true);
             } else {
@@ -484,21 +469,6 @@
       const glyph = img.includes(ext) ? '🖼️' : vid.includes(ext) ? '🎬' : aud.includes(ext) ? '🎵'
         : doc.includes(ext) ? '📄' : zip.includes(ext) ? '📦' : '📁';
       return `<span style="font-size:15px">${glyph}</span>`;
-    }
-
-    // Pure-UI animation mimicking a chunked upload.
-    function simulateRow(id) {
-      const duration = 1800 + Math.random() * 2600, start = performance.now();
-      function tick(now) {
-        const x = xfers.get(id); if (!x) return;
-        const t = Math.min(1, (now - start) / duration);
-        const eased = 1 - Math.pow(1 - t, 2.2);
-        const pct = Math.min(t === 1 ? 100 : 99, Math.floor(eased * 100 + (t < 1 ? Math.random() * 2.5 : 0)));
-        x.el.querySelector('.pct').textContent = pct + '%';
-        x.el.querySelector('.bar > i').style.width = pct + '%';
-        if (t < 1) requestAnimationFrame(tick); else finishRow(id, true);
-      }
-      requestAnimationFrame(tick);
     }
 
     function finishRow(id, ok, error) {
