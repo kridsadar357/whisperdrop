@@ -26,6 +26,18 @@ Drag a file onto the 12px strip at the right edge of your screen — it expands 
 - **Transfer queue and history** — multiple dropped files are sent sequentially, with per-file progress, failure state and an activity log available from the tray.
 - **System tray** — Preferences, received-files folder, activity log and Quit. Windows is a GUI/tray app rather than a console process.
 
+## Install
+
+**Homebrew (macOS / Linux)**
+
+```bash
+brew tap kridsadar357/whisperdrop
+brew trust kridsadar357/whisperdrop      # newer Homebrew asks once for third-party taps
+brew install whisperdrop
+```
+
+**Prebuilt binaries** — every [release](https://github.com/kridsadar357/whisperdrop/releases) ships `whisperdrop` for macOS (arm64 + Intel), Linux x86_64 and Windows x86_64 (`.zip`), with `checksums.txt`. The Windows zip is the full app + CLI; the macOS GUI app (`WhisperDrop.app`) is built separately with `npm run tauri build` and needs signing before it can be distributed as a cask.
+
 ## Development
 
 ```bash
@@ -40,6 +52,21 @@ cargo clippy
 ```
 
 Build a release bundle: `npm run tauri build`.
+
+### Releasing
+
+```bash
+git tag v0.3.1 && git push origin v0.3.1
+```
+
+`.github/workflows/release.yml` builds `whisperdrop` for all four targets, publishes the GitHub release with `checksums.txt`, and — if the repo has a `TAP_GITHUB_TOKEN` secret (a PAT with write access to `homebrew-whisperdrop`) — regenerates the tap formula. Without the secret, update it by hand:
+
+```bash
+gh release download vX.Y.Z --pattern checksums.txt
+scripts/gen-formula.sh kridsadar357 X.Y.Z checksums.txt > ../homebrew-whisperdrop/Formula/whisperdrop.rb
+```
+
+`tap-check.yml` then installs the formula on a clean macOS runner.
 
 The `whisperdrop` binary (Windows app + CLI on every platform; cross-compiled for Windows from the Mac with Homebrew MinGW):
 
