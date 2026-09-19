@@ -18,11 +18,15 @@ Drag a file onto the 12px strip at the right edge of your screen — it expands 
   whisperdrop send big.zip --to 482913         # 6-digit group id → encrypted tunnel
   whisperdrop status                           # config summary + relay check
   whisperdrop setup                            # wizard
+  whisperdrop group create                     # new group, this device is the head
+  whisperdrop group join 482913                # ask the head to admit this device
+  whisperdrop group pending | approve <id> | members | kick <device> | leave
   ```
 - **Streaming receiver** (`src-tauri/src/server.rs`) — an axum HTTP server on port **51730** (auto-increments if busy) that streams request bodies chunk-by-chunk to `~/Downloads/BridgeReceived/`. Handles 10GB+ files without memory spikes; filenames are sanitized and collisions deduplicated (`a (1).txt`).
 - **Streaming sender** (`src-tauri/src/client.rs`) — `reqwest` POST with a `ReaderStream`-wrapped `tokio::fs::File`, so the file is never fully loaded into RAM.
 - **mDNS discovery** (`src-tauri/src/mdns.rs`) — registers `_bridge-service._tcp.local.` and browses for peers; `get_online_peers()` returns live peers (stale entries expire after 75s, self filtered out).
-- **Trusted tunnel pairing** — set the same pairing passphrase on each trusted device in Preferences. Tunnel payloads then use XChaCha20-Poly1305 end-to-end encryption; the relay sees only encrypted bytes. Never share the passphrase in chat or add it to source control.
+- **Owned groups** — cross-network transfers go through a group on the relay. One device *creates* the group and becomes its **head**; the relay issues the 6-digit number (never chosen by a client, never reused). Any other device *requests* to join with that number, and the head approves or denies it right in the drop zone (or via `whisperdrop group approve`). Only approved devices hold a member token, and the relay refuses everything else — knowing the number alone reveals nothing: no presence, no file names, no frames. The head can list, remove and re-admit members.
+- **Trusted tunnel pairing** — on top of membership, set the same pairing passphrase on each device in Preferences. Tunnel payloads then use XChaCha20-Poly1305 end-to-end encryption; the relay sees only encrypted bytes. Never share the passphrase in chat or add it to source control.
 - **Transfer queue and history** — multiple dropped files are sent sequentially, with per-file progress, failure state and an activity log available from the tray.
 - **System tray** — Preferences, received-files folder, activity log and Quit. Windows is a GUI/tray app rather than a console process.
 
@@ -83,7 +87,12 @@ cp target/x86_64-pc-windows-gnu/release/whisperdrop.exe ../dist/WhisperDrop.exe
 
 ## Tunnel security
 
-For any device that uses the internet relay, enable Tunnel and enter an identical, strong pairing passphrase on every device in that trust group. New wizard saves require it when Tunnel is enabled. The passphrase derives an in-memory encryption key and is never included in relay frames. LAN transfers remain direct and use your local network's security boundary.
+Two layers protect cross-network transfers:
+
+1. **Membership** — the relay only routes between devices holding a member token for the same group. Tokens are issued when the head creates the group or approves a join request, stored in the local config, and revoked by `kick`/`leave`. Guessing a group number gets you nothing.
+2. **Encryption** — enable Tunnel and enter an identical, strong pairing passphrase on every device in the group. The passphrase derives an in-memory XChaCha20-Poly1305 key; file contents are opaque to the relay. Never put the passphrase in relay frames, chat or source control.
+
+LAN transfers remain direct and use your local network's security boundary.
 
 ## Transfer between two instances on one machine
 

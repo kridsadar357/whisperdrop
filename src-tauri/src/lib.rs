@@ -296,18 +296,12 @@ async fn wizard_finish(
     tunnel_enabled: bool,
     relay: String,
     device_id: String,
-    group_id: String,
     shared_secret: String,
     known_tunnel_devices: String,
     receive_dir: String,
 ) -> Result<(), String> {
-    let group_id = group_id.trim().to_string();
-    if tunnel_enabled && (group_id.len() != 6 || !group_id.chars().all(|c| c.is_ascii_digit())) {
-        return Err("group id must be 6 digits".into());
-    }
     let mut cfg = get_cfg();
     cfg.position = position;
-    cfg.group_id = group_id;
     cfg.tunnel.enabled = tunnel_enabled;
     cfg.tunnel.relay = relay;
     cfg.tunnel.device_id = device_id;
@@ -325,6 +319,140 @@ async fn wizard_finish(
     app_config::save(&cfg)?;
     apply_config(&app, &cfg);
     Ok(())
+}
+
+// ---------------------------------------------------------- group admin
+fn device_name() -> String {
+    hostname()
+}
+
+fn save_membership(app: &AppHandle, group: &str, token: &str, role: &str) -> Result<(), String> {
+    let mut cfg = get_cfg();
+    cfg.group_id = group.to_string();
+    cfg.tunnel.member_token = token.to_string();
+    cfg.tunnel.role = role.to_string();
+    cfg.tunnel.pending_request.clear();
+    cfg.tunnel.enabled = true;
+    app_config::save(&cfg)?;
+    apply_config(app, &cfg);
+    activity::write(format!("joined group {group} as {role}"));
+    Ok(())
+}
+
+/// Create a new group on the relay; this device becomes its head.
+#[tauri::command]
+async fn group_create(app: AppHandle) -> Result<String, String> {
+    let cfg = get_cfg();
+    let (group, token) = tunnel::group_create(&cfg.tunnel.relay, &cfg.tunnel.device_id, &device_name()).await?;
+    save_membership(&app, &group, &token, "head")?;
+    Ok(group)
+}
+
+/// Ask to join `group`; resolves when the head decides or after ~25s (pending).
+#[tauri::command]
+async fn group_join(app: AppHandle, group: String) -> Result<tunnel::JoinOutcome, String> {
+    let group = group.trim().to_string();
+    if group.len() != 6 || !group.chars().all(|c| c.is_ascii_digit()) {
+        return Err("group id must be 6 digits".into());
+    }
+    let cfg = get_cfg();
+    let outcome = tunnel::group_join(&cfg.tunnel.relay, &group, &cfg.tunnel.device_id, &device_name(), 25).await?;
+    finish_join(&app, &group, &outcome)?;
+    Ok(outcome)
+}
+
+/// Poll a join request left pending earlier.
+#[tauri::command]
+async fn group_join_status(app: AppHandle) -> Result<tunnel::JoinOutcome, String> {
+    let cfg = get_cfg();
+    if cfg.tunnel.pending_request.is_empty() {
+        return Err("no pending join request".into());
+    }
+    let outcome = tunnel::group_join_status(&cfg.tunnel.relay, &cfg.group_id, &cfg.tunnel.pending_request).await?;
+    finish_join(&app, &cfg.group_id, &outcome)?;
+    Ok(outcome)
+}
+
+fn finish_join(app: &AppHandle, group: &str, outcome: &tunnel::JoinOutcome) -> Result<(), String> {
+    match outcome {
+        tunnel::JoinOutcome::Approved { token } => save_membership(app, group, token, "member"),
+        tunnel::JoinOutcome::Pending { request_id } => {
+            let mut cfg = get_cfg();
+            cfg.group_id = group.to_string();
+            cfg.tunnel.pending_request = request_id.clone();
+            app_config::save(&cfg)?;
+            *CFG.lock().unwrap() = Some(cfg);
+            Ok(())
+        }
+        tunnel::JoinOutcome::Denied => {
+            let mut cfg = get_cfg();
+            cfg.tunnel.pending_request.clear();
+            app_config::save(&cfg)?;
+            *CFG.lock().unwrap() = Some(cfg);
+            Ok(())
+        }
+    }
+}
+
+/// Head: approve or deny a join request.
+#[tauri::command]
+async fn group_approve(request_id: String, approved: bool) -> Result<(), String> {
+    let cfg = get_cfg();
+    tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, json!({"type":"approve","request_id":request_id,"approved":approved}), &["ok"]).await?;
+    activity::write(format!("join request {request_id} {}", if approved { "approved" } else { "denied" }));
+    Ok(())
+}
+
+/// Head: requests still waiting.
+#[tauri::command]
+async fn group_pending() -> Result<serde_json::Value, String> {
+    let cfg = get_cfg();
+    let v = tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, json!({"type":"pending"}), &["pending"]).await?;
+    Ok(v["requests"].clone())
+}
+
+/// Everyone: the group's member list with online flags.
+#[tauri::command]
+async fn group_members() -> Result<serde_json::Value, String> {
+    let cfg = get_cfg();
+    let v = tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, json!({"type":"members"}), &["members"]).await?;
+    Ok(v["members"].clone())
+}
+
+/// Head: remove a device from the group.
+#[tauri::command]
+async fn group_kick(device_id: String) -> Result<(), String> {
+    let cfg = get_cfg();
+    tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, json!({"type":"kick","device_id":device_id}), &["ok"]).await?;
+    Ok(())
+}
+
+/// Leave the current group (forget the token).
+#[tauri::command]
+async fn group_leave(app: AppHandle) -> Result<(), String> {
+    let mut cfg = get_cfg();
+    if !cfg.group_id.is_empty() && !cfg.tunnel.member_token.is_empty() {
+        let _ = tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, json!({"type":"leave"}), &["ok"]).await;
+    }
+    cfg.group_id.clear();
+    cfg.tunnel.member_token.clear();
+    cfg.tunnel.role.clear();
+    cfg.tunnel.pending_request.clear();
+    app_config::save(&cfg)?;
+    apply_config(&app, &cfg);
+    Ok(())
+}
+
+#[tauri::command]
+fn tunnel_status() -> serde_json::Value {
+    let cfg = get_cfg();
+    json!({
+        "status": tunnel::status(),
+        "group": cfg.group_id,
+        "role": cfg.tunnel.role,
+        "pending_request": cfg.tunnel.pending_request,
+        "enabled": cfg.tunnel.enabled,
+    })
 }
 
 #[tauri::command]
@@ -592,6 +720,15 @@ pub fn run() {
             send_file_tunnel,
             set_edge_mode,
             edge_cursor_inside,
+            group_create,
+            group_join,
+            group_join_status,
+            group_approve,
+            group_pending,
+            group_members,
+            group_kick,
+            group_leave,
+            tunnel_status,
             get_online_peers,
             get_config,
             get_tunnel_peers,

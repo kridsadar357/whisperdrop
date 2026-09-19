@@ -84,6 +84,163 @@ fn start_tunnel(cfg: &config::Config) {
     }
 }
 
+static RT: Mutex<Option<tokio::runtime::Handle>> = Mutex::new(None);
+pub fn rt_handle() -> Option<tokio::runtime::Handle> {
+    RT.lock().unwrap().clone()
+}
+
+/// Native Yes/No dialog (Windows) — used for join-request approvals.
+#[cfg(windows)]
+pub fn win_confirm(title: &str, text: &str) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    const MB_YESNO: u32 = 0x4;
+    const MB_ICONQUESTION: u32 = 0x20;
+    const MB_TOPMOST: u32 = 0x40000;
+    const MB_SETFOREGROUND: u32 = 0x10000;
+    const IDYES: i32 = 6;
+    unsafe { MessageBoxW(0, w(text).as_ptr(), w(title).as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES }
+}
+
+/// Persist a new membership and restart the tunnel with it.
+pub fn save_membership(group: &str, token: &str, role: &str) -> Result<(), String> {
+    let mut cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    cfg.group_id = group.to_string();
+    cfg.tunnel.member_token = token.to_string();
+    cfg.tunnel.role = role.to_string();
+    cfg.tunnel.pending_request.clear();
+    cfg.tunnel.enabled = true;
+    config::save(&cfg)?;
+    *RUNTIME_CFG.lock().unwrap() = Some(cfg.clone());
+    tunnel::set_group(cfg.group_id.clone());
+    if rt_handle().is_some() && tokio::runtime::Handle::try_current().is_ok() {
+        start_tunnel(&cfg);
+    }
+    activity::write(format!("joined group {group} as {role}"));
+    Ok(())
+}
+
+/// Apply a join outcome to the config (approved → member, pending → remembered).
+pub fn finish_join(group: &str, outcome: &tunnel::JoinOutcome) -> Result<(), String> {
+    match outcome {
+        tunnel::JoinOutcome::Approved { token } => save_membership(group, token, "member"),
+        tunnel::JoinOutcome::Pending { request_id } => {
+            let mut cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+            cfg.group_id = group.to_string();
+            cfg.tunnel.pending_request = request_id.clone();
+            config::save(&cfg)?;
+            *RUNTIME_CFG.lock().unwrap() = Some(cfg);
+            Ok(())
+        }
+        tunnel::JoinOutcome::Denied => {
+            let mut cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+            cfg.tunnel.pending_request.clear();
+            config::save(&cfg)?;
+            *RUNTIME_CFG.lock().unwrap() = Some(cfg);
+            Ok(())
+        }
+    }
+}
+
+pub fn leave_group() -> Result<(), String> {
+    let mut cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    cfg.group_id.clear();
+    cfg.tunnel.member_token.clear();
+    cfg.tunnel.role.clear();
+    cfg.tunnel.pending_request.clear();
+    config::save(&cfg)?;
+    *RUNTIME_CFG.lock().unwrap() = Some(cfg.clone());
+    tunnel::set_group(String::new());
+    if tokio::runtime::Handle::try_current().is_ok() {
+        start_tunnel(&cfg);
+    }
+    Ok(())
+}
+
+// ---- wizard page: group endpoints ----
+fn json_ok<T: serde::Serialize>(v: T) -> String {
+    serde_json::json!({"ok": true, "result": v}).to_string()
+}
+fn json_err(e: String) -> String {
+    serde_json::json!({"ok": false, "err": e}).to_string()
+}
+
+async fn api_group_create() -> String {
+    let cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    match tunnel::group_create(&cfg.tunnel.relay, &cfg.tunnel.device_id, &hostname()).await {
+        Ok((group, token)) => match save_membership(&group, &token, "head") {
+            Ok(()) => json_ok(group),
+            Err(e) => json_err(e),
+        },
+        Err(e) => json_err(e),
+    }
+}
+
+async fn api_group_join(body: String) -> String {
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let group = v["group"].as_str().unwrap_or("").trim().to_string();
+    if group.len() != 6 || !group.chars().all(|c| c.is_ascii_digit()) {
+        return json_err("group id must be 6 digits".into());
+    }
+    let cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    match tunnel::group_join(&cfg.tunnel.relay, &group, &cfg.tunnel.device_id, &hostname(), 25).await {
+        Ok(outcome) => match finish_join(&group, &outcome) {
+            Ok(()) => json_ok(outcome),
+            Err(e) => json_err(e),
+        },
+        Err(e) => json_err(e),
+    }
+}
+
+async fn api_group_join_status() -> String {
+    let cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    if cfg.tunnel.pending_request.is_empty() {
+        return json_err("no pending join request".into());
+    }
+    match tunnel::group_join_status(&cfg.tunnel.relay, &cfg.group_id, &cfg.tunnel.pending_request).await {
+        Ok(outcome) => match finish_join(&cfg.group_id, &outcome) {
+            Ok(()) => json_ok(outcome),
+            Err(e) => json_err(e),
+        },
+        Err(e) => json_err(e),
+    }
+}
+
+async fn api_group_leave() -> String {
+    let cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    if !cfg.group_id.is_empty() && !cfg.tunnel.member_token.is_empty() {
+        let _ = tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, serde_json::json!({"type":"leave"}), &["ok"]).await;
+    }
+    match leave_group() {
+        Ok(()) => json_ok(true),
+        Err(e) => json_err(e),
+    }
+}
+
+async fn api_group_query(body: String) -> String {
+    // {"frame": {...}, "reply": "members"} — head-only frames are enforced by the relay
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+    let reply = v["reply"].as_str().unwrap_or("ok").to_string();
+    let cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    match tunnel::group_query(&cfg.tunnel.relay, &cfg.group_id, v["frame"].clone(), &[reply.as_str()]).await {
+        Ok(r) => json_ok(r),
+        Err(e) => json_err(e),
+    }
+}
+
+async fn api_tunnel_status() -> String {
+    let cfg = RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(config::load);
+    serde_json::json!({
+        "status": tunnel::status(), "group": cfg.group_id, "role": cfg.tunnel.role,
+        "pending_request": cfg.tunnel.pending_request, "enabled": cfg.tunnel.enabled,
+        "member": !cfg.tunnel.member_token.is_empty(),
+    })
+    .to_string()
+}
+
 /// Move the drop zone + overlay to the other screen edge and persist it
 /// (used by the strip's context menu).
 pub fn set_position(position: &str) {
@@ -381,11 +538,6 @@ async fn wizard_finish(body: String) -> Result<String, (StatusCode, String)> {
         .as_str()
         .unwrap_or("wss://riki-api.online/ws")
         .to_string();
-    if let Some(g) = v["group_id"].as_str() {
-        if g.chars().all(|c| c.is_ascii_digit()) && g.len() == 6 {
-            cfg.group_id = g.to_string();
-        }
-    }
     cfg.tunnel.device_id = v["device_id"]
         .as_str()
         .unwrap_or(&cfg.tunnel.device_id)
@@ -780,6 +932,8 @@ async fn main() {
         });
     }
 
+    *RT.lock().unwrap() = Some(tokio::runtime::Handle::current());
+
     // ---- drag-drop edge strip (Windows) ----
     #[cfg(windows)]
     dropzone::start_with_port(&cfg.position, tokio::runtime::Handle::current(), port);
@@ -807,6 +961,12 @@ async fn main() {
         .route("/api/wizard/state", get(wizard_state))
         .route("/api/wizard/test-tunnel", post(wizard_test_tunnel))
         .route("/api/wizard/finish", post(wizard_finish))
+        .route("/api/group/create", post(api_group_create))
+        .route("/api/group/join", post(api_group_join))
+        .route("/api/group/join-status", get(api_group_join_status))
+        .route("/api/group/leave", post(api_group_leave))
+        .route("/api/group/query", post(api_group_query))
+        .route("/api/tunnel/status", get(api_tunnel_status))
         .route("/api/pairing/qr", get(pairing_qr))
         .route("/api/pairing/apply", post(pairing_apply))
         .route("/api/devices/refresh", get(refresh_devices))

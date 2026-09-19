@@ -20,6 +20,157 @@ use std::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 
 pub static TUNNEL_PEERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Link state for the UI/CLI: "connecting", "online (head)", "not a member: …".
+pub static TUNNEL_STATUS: Mutex<String> = Mutex::new(String::new());
+pub fn status() -> String {
+    TUNNEL_STATUS.lock().unwrap().clone()
+}
+fn set_status(s: impl Into<String>) {
+    *TUNNEL_STATUS.lock().unwrap() = s.into();
+}
+
+type Tx = futures_util::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+type Rx = futures_util::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+fn cfg_snapshot() -> crate::config::Config {
+    crate::RUNTIME_CFG.lock().unwrap().clone().unwrap_or_else(crate::config::load)
+}
+
+/// `register` frame carrying this device's id and member token.
+fn register_frame(group: &str) -> Message {
+    let cfg = cfg_snapshot();
+    Message::text(
+        json!({"type":"register","group":group,"id":cfg.tunnel.device_id,"token":cfg.tunnel.member_token}).to_string(),
+    )
+}
+
+/// Read frames until the relay accepts (`registered`) or refuses (`error`).
+async fn await_registered(rx: &mut Rx) -> Result<serde_json::Value, String> {
+    await_type(rx, &["registered"], 10).await
+}
+
+/// Read frames until one of `types` arrives (or the timeout). `error` frames fail.
+async fn await_type(rx: &mut Rx, types: &[&str], secs: u64) -> Result<serde_json::Value, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, rx.next())
+            .await
+            .map_err(|_| "timed out waiting for the relay".to_string())?
+            .ok_or("relay closed the connection".to_string())?
+            .map_err(|e| format!("relay read: {e}"))?;
+        let Message::Text(t) = msg else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+        if v["type"].as_str() == Some("error") {
+            return Err(v["err"].as_str().unwrap_or("relay error").to_string());
+        }
+        if types.contains(&v["type"].as_str().unwrap_or("")) {
+            return Ok(v);
+        }
+    }
+}
+
+// ------------------------------------------------------------ group admin
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum JoinOutcome {
+    Approved { token: String },
+    Denied,
+    Pending { request_id: String },
+}
+
+fn join_outcome(v: &serde_json::Value) -> JoinOutcome {
+    match v["type"].as_str() {
+        Some("join_result") => {
+            if v["approved"].as_bool().unwrap_or(false) {
+                JoinOutcome::Approved { token: v["token"].as_str().unwrap_or("").to_string() }
+            } else {
+                JoinOutcome::Denied
+            }
+        }
+        _ => JoinOutcome::Pending { request_id: v["request_id"].as_str().unwrap_or("").to_string() },
+    }
+}
+
+/// Ask the relay for a brand-new group; this device becomes its head.
+pub async fn group_create(relay: &str, device_id: &str, device_name: &str) -> Result<(String, String), String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(json!({"type":"create_group","device_id":device_id,"device_name":device_name}).to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let v = await_type(&mut rx, &["group_created"], 10).await?;
+    Ok((v["group"].as_str().unwrap_or("").to_string(), v["token"].as_str().unwrap_or("").to_string()))
+}
+
+/// Request to join `group`; waits up to `wait_secs` for the head's decision.
+pub async fn group_join(relay: &str, group: &str, device_id: &str, device_name: &str, wait_secs: u64) -> Result<JoinOutcome, String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(json!({"type":"join_request","group":group,"device_id":device_id,"device_name":device_name}).to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let pending = await_type(&mut rx, &["join_pending"], 10).await?;
+    let request_id = pending["request_id"].as_str().unwrap_or("").to_string();
+    match await_type(&mut rx, &["join_result"], wait_secs).await {
+        Ok(v) => Ok(join_outcome(&v)),
+        Err(_) => Ok(JoinOutcome::Pending { request_id }),
+    }
+}
+
+/// Re-check a request made earlier.
+pub async fn group_join_status(relay: &str, group: &str, request_id: &str) -> Result<JoinOutcome, String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(json!({"type":"join_status","group":group,"request_id":request_id}).to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let v = await_type(&mut rx, &["join_result", "join_pending"], 10).await?;
+    Ok(join_outcome(&v))
+}
+
+/// One-shot authenticated request: register, send `frame`, return the reply.
+pub async fn group_query(relay: &str, group: &str, frame: serde_json::Value, reply_types: &[&str]) -> Result<serde_json::Value, String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    await_registered(&mut rx).await?;
+    tx.send(Message::text(frame.to_string())).await.map_err(|e| e.to_string())?;
+    await_type(&mut rx, reply_types, 10).await
+}
+
+/// A join request arrived (this device is the head): ask the user.
+/// Windows shows a native Yes/No dialog; elsewhere the CLI is the way.
+fn on_join_request(v: &serde_json::Value) {
+    let name = v["device_name"].as_str().unwrap_or("a device").to_string();
+    let dev = v["device_id"].as_str().unwrap_or("?").to_string();
+    let group = v["group"].as_str().unwrap_or("").to_string();
+    let rid = v["request_id"].as_str().unwrap_or("").to_string();
+    println!("[tunnel] join request: {name} ({dev}) wants to join group {group} — approve with: whisperdrop group approve {rid}");
+    crate::activity::write(format!("join request from {name} ({dev}) — id {rid}"));
+    #[cfg(windows)]
+    {
+        let (relay, cfg_group) = {
+            let c = cfg_snapshot();
+            (c.tunnel.relay.clone(), c.group_id.clone())
+        };
+        let Some(handle) = crate::rt_handle() else { return };
+        std::thread::spawn(move || {
+            let text = format!(
+                "\"{name}\" (device {dev}) wants to join your WhisperDrop group {group}.\n\nApproving lets it see your group and exchange files with you.\n\nApprove?"
+            );
+            let yes = crate::win_confirm("WhisperDrop — join request", &text);
+            handle.spawn(async move {
+                let r = group_query(&relay, &cfg_group, json!({"type":"approve","request_id":rid,"approved":yes}), &["ok"]).await;
+                println!("[tunnel] {} {name}: {:?}", if yes { "approved" } else { "denied" }, r.map(|_| ()));
+            });
+        });
+    }
+}
 static SENT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn sent_count() -> u64 {
@@ -132,7 +283,18 @@ async fn connect(
 /// back to its sender, so a round trip is proven by registering in a
 /// throwaway group and getting the relay's own `devices` reply.
 pub async fn check_relay(relay: &str, self_id: &str) -> Result<(), String> {
+    if current_group().is_empty() || cfg_snapshot().tunnel.member_token.is_empty() {
+        return ping(relay).await;
+    }
     devices(relay, self_id).await.map(|_| ())
+}
+
+/// Membership-less reachability probe.
+pub async fn ping(relay: &str) -> Result<(), String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(json!({"type":"ping"}).to_string())).await.map_err(|e| e.to_string())?;
+    await_type(&mut rx, &["pong"], 8).await.map(|_| ())
 }
 
 fn host_port(url: &str) -> (String, u16) {
@@ -255,19 +417,13 @@ fn unb64(s: &str) -> Vec<u8> {
 pub async fn devices(relay: &str, self_id: &str) -> Result<Vec<String>, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    let request_id = session_id("probe", self_id);
-    // The relay is group-scoped: registering without a group is dropped.
-    // A probe joins the configured group (so the reply lists real peers)
-    // or a throwaway one when none is set.
-    let group = {
-        let g = current_group();
-        if g.is_empty() { format!("probe-{}", std::process::id()) } else { g }
-    };
-    tx.send(Message::text(
-        json!({"type":"register","id":request_id,"group":group}).to_string(),
-    ))
-    .await
-    .map_err(|e| e.to_string())?;
+    let request_id = self_id.to_string();
+    let group = current_group();
+    if group.is_empty() {
+        return Err("not in a group — run `whisperdrop group create` or `whisperdrop group join <id>`".into());
+    }
+    tx.send(register_frame(&group)).await.map_err(|e| e.to_string())?;
+    await_registered(&mut rx).await?;
     tx.send(Message::text(json!({"type":"devices"}).to_string()))
         .await
         .map_err(|e| e.to_string())?;
@@ -322,12 +478,9 @@ async fn send_over_tunnel_once(
 ) -> Result<u64, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    let request_id = session_id("send", "tunnel");
-    tx.send(Message::text(
-        json!({"type":"register","group":group,"id":request_id}).to_string(),
-    ))
-    .await
-    .map_err(|e| e.to_string())?;
+    let request_id = cfg_snapshot().tunnel.device_id;
+    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    await_registered(&mut rx).await?;
 
     let name = std::path::Path::new(path)
         .file_name()
@@ -421,21 +574,33 @@ async fn send_over_tunnel_once(
 /// Reconnects automatically until the process exits.
 pub async fn receive_loop(relay: String, self_id: String) {
     let group = current_group();
+    if group.is_empty() || cfg_snapshot().tunnel.member_token.is_empty() {
+        set_status("not in a group — create or join one (Preferences / `whisperdrop group`)");
+        println!("[tunnel] no group membership yet — tunnel idle");
+        return;
+    }
     loop {
         println!("[tunnel] connecting {relay} as {self_id}…");
+        set_status("connecting");
         match connect(&relay).await {
             Ok((ws, _)) => {
                 println!("[tunnel] connected ✓");
                 let (mut tx, mut rx) = ws.split();
-                if tx
-                    .send(Message::text(
-                        json!({"type":"register","group":group,"id":self_id}).to_string(),
-                    ))
-                    .await
-                    .is_err()
-                {
+                if tx.send(register_frame(&group)).await.is_err() {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
+                }
+                match await_registered(&mut rx).await {
+                    Ok(v) => {
+                        let role = v["role"].as_str().unwrap_or("member");
+                        set_status(format!("online ({role})"));
+                        println!("[tunnel] registered as {role} of group {group}");
+                    }
+                    Err(e) => {
+                        println!("[tunnel] registration refused: {e}");
+                        set_status(format!("not a member: {e}"));
+                        return; // wait for a config change instead of hammering the relay
+                    }
                 }
                 // The relay returns membership only when asked. Poll without
                 // reconnecting so peers on another network appear shortly
@@ -468,9 +633,11 @@ pub async fn receive_loop(relay: String, self_id: String) {
                     }
                 }
                 println!("[tunnel] disconnected — retrying in 3s");
+                set_status("reconnecting");
             }
             Err(e) => {
                 println!("[tunnel] connect failed: {e} — retrying in 3s");
+                set_status(format!("relay unreachable: {e}"));
             }
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -492,6 +659,13 @@ async fn handle_frame(
         Err(_) => return,
     };
     match v["type"].as_str().unwrap_or("") {
+        "join_request" => on_join_request(&v),
+        "registered" | "ok" | "members" | "pending" | "join_decided" => {}
+        "error" => {
+            let e = v["err"].as_str().unwrap_or("relay error");
+            println!("[tunnel] relay: {e}");
+            set_status(format!("relay: {e}"));
+        }
         "devices" => {
             if let Some(arr) = v["ids"].as_array() {
                 let ids: Vec<String> = arr

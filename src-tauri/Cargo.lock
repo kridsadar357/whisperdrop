@@ -5257,7 +5257,7 @@ dependencies = [
 
 [[package]]
 name = "whisperdrop"
-version = "0.2.3"
+version = "0.4.0"
 dependencies = [
  "axum",
  "chacha20poly1305",

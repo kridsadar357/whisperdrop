@@ -48,7 +48,7 @@ curl -s -m 5 "http://127.0.0.1:51730/health" | grep -q bridge-ok && ok "restart:
 echo "=== 5. tunnel reachability (if relay configured) ==="
 # match only the probe's own result line — "ok" also appears inside hostnames in mDNS log lines
 (timeout 30 "$RX" status 2>&1 | grep -q "relay       : reachable" ) && ok "tunnel relay reachable" || bad "tunnel relay unreachable (relay down? Cloudflare 522 = origin not responding — see relay/DEPLOY.md)"
-if [ -n "$TUNNEL_GROUP" ]; then
+if [ -n "$TUNNEL_GROUP" ]; then  # this machine must already be a member (whisperdrop group join)
   # a receiver in the same group (same pairing passphrase) must be online elsewhere
   (timeout 150 "$RX" send /tmp/tm-1mb.bin --to "$TUNNEL_GROUP" --relay="$RELAY" ${TUNNEL_SECRET:+--secret="$TUNNEL_SECRET"} > /tmp/tm-tunnel.log 2>&1 < /dev/null)
   grep -q "✓ sent" /tmp/tm-tunnel.log && ok "tunnel transfer sent + confirmed by receiver" || bad "tunnel transfer failed (see /tmp/tm-tunnel.log)"

@@ -193,6 +193,16 @@
   .btn.primary { background: linear-gradient(135deg, var(--accent-a), var(--accent-b)); border-color: transparent; }
   .btn.primary:hover { filter: brightness(1.08); }
 
+  /* ---------- join-request approval ---------- */
+  #approve { display: none; flex-direction: column; gap: 14px; flex: 1; justify-content: center; }
+  #approve .who { display: flex; align-items: center; gap: 12px; padding: 14px; border-radius: 16px;
+    background: rgba(255,255,255,.08); border: 1px solid rgba(255,255,255,.10); }
+  #approve .who .name { font-size: 15px; font-weight: 700; }
+  #approve .who .meta { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+  #approve .note { font-size: 12px; color: var(--muted); line-height: 1.45; text-align: center; padding: 0 8px; }
+  #approve .acts { display: flex; gap: 10px; }
+  .btn.danger { background: rgba(251,113,133,.18); border-color: rgba(251,113,133,.35); color: var(--bad); }
+
   /* ---------- right-click menu ---------- */
   #menu {
     position: absolute; inset: 0; display: none; flex-direction: column; gap: 4px;
@@ -241,6 +251,11 @@
       </div>
       <div class="list" id="peerList"></div>
       <div class="list" id="progressList" style="display:none"></div>
+      <div id="approve">
+        <div class="who"><div class="avatar" id="apAvatar"></div><div><div class="name" id="apName"></div><div class="meta" id="apMeta"></div></div></div>
+        <div class="note">Approving lets this device see your group, receive your files and send you files. Only approve devices you recognise.</div>
+        <div class="acts"><button class="btn danger" id="apDeny">Deny</button><button class="btn primary" id="apOk">Approve</button></div>
+      </div>
       <div class="foot" id="peerFoot">
         <button class="btn" id="refreshBtn">↻ Refresh</button>
         <button class="btn" id="addIpBtn">+ Add by IP</button>
@@ -277,7 +292,7 @@
       try {
         const cfg = await invoke('get_config');
         SIDE = cfg.position === 'left' ? 'left' : 'right';
-        GROUP = cfg.tunnel && cfg.tunnel.enabled ? (cfg.group_id || '') : '';
+        GROUP = cfg.tunnel && cfg.tunnel.enabled && cfg.tunnel.member_token ? (cfg.group_id || '') : '';
       } catch (e) { dbg('get_config failed ' + e); }
       applySide();
     }
@@ -307,6 +322,7 @@
 
     async function openPeerPicker(files) {
       pendingFiles = files || [];
+      $('approve').style.display = 'none'; showingRequest = null;
       peerListEl.style.display = 'flex';
       progressListEl.style.display = 'none';
       progressListEl.innerHTML = '';
@@ -421,6 +437,7 @@
 
     /* ---------- transfer + progress ---------- */
     const xfers = new Map();
+    let showingRequest = null; // join request currently on screen (head only)
 
     async function startTransfer(peer) {
       dbg(`start-transfer ${peer.name} files=${pendingFiles.length}`);
@@ -497,6 +514,46 @@
       x.el.querySelector('.fmeta').textContent = `${fmtBytes(sent)} / ${fmtBytes(total)}`;
     });
     await listen('transfer-done', (e) => finishRow(e.payload.transferId, e.payload.ok, e.payload.error));
+
+    /* ---------- join requests (this device is the group head) ---------- */
+    const joinQueue = [];
+    function showNextRequest() {
+      if (showingRequest || !joinQueue.length) return;
+      const r = joinQueue.shift();
+      showingRequest = r;
+      peerListEl.style.display = 'none'; progressListEl.style.display = 'none'; peerFoot.style.display = 'none';
+      $('approve').style.display = 'flex';
+      panelTitle.textContent = 'Join request';
+      panelSubtitle.textContent = `wants to join group ${r.group}`;
+      $('apAvatar').replaceWith(Object.assign(avatar(r.device_name || r.device_id), { id: 'apAvatar' }));
+      $('apName').textContent = r.device_name || r.device_id;
+      $('apMeta').textContent = `device id ${r.device_id}`;
+      setMode('panel');
+    }
+    async function decide(approved) {
+      const r = showingRequest; if (!r) return;
+      $('apOk').disabled = $('apDeny').disabled = true;
+      try { await invoke('group_approve', { requestId: r.request_id, approved }); }
+      catch (e) { dbg('approve failed ' + e); }
+      $('apOk').disabled = $('apDeny').disabled = false;
+      showingRequest = null;
+      $('approve').style.display = 'none';
+      if (joinQueue.length) showNextRequest(); else showStrip();
+    }
+    $('apOk').onclick = () => decide(true);
+    $('apDeny').onclick = () => decide(false);
+    await listen('tunnel-join-request', (e) => {
+      const r = e.payload;
+      if (joinQueue.some(q => q.request_id === r.request_id) || (showingRequest && showingRequest.request_id === r.request_id)) return;
+      joinQueue.push(r);
+      if (mode === 'strip' || mode === 'panel' && showingRequest === null && !xfers.size) showNextRequest();
+    });
+    await listen('tunnel-join-decided', (e) => {
+      const id = e.payload.request_id;
+      const i = joinQueue.findIndex(q => q.request_id === id); if (i >= 0) joinQueue.splice(i, 1);
+      if (showingRequest && showingRequest.request_id === id) { showingRequest = null; $('approve').style.display = 'none'; if (joinQueue.length) showNextRequest(); else showStrip(); }
+    });
+    await listen('tunnel-status', () => loadConfig());
 
     // Rust re-docks every window when monitors change or the side flips.
     await listen('edge-reset', (e) => {

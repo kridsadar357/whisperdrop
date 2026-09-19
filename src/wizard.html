@@ -99,12 +99,22 @@
     <div style="margin-top:12px" class="dim">This device's identity:
       <b id="devid" style="color:#64d2ff;font-family:ui-monospace"></b></div>
     <div style="margin-top:12px">
-      <div style="font-size:13px;font-weight:700;margin-bottom:6px">Group ID (6 digits)</div>
-      <input type="text" id="groupId" maxlength="6" inputmode="numeric"
-        placeholder="เช่น 482913 — ตัวเลขเดียวกันทุกเครื่องที่ต้องการส่งหากัน" />
-      <div class="dim" style="font-size:11px;margin-top:4px">
-        ทุกเครื่องที่ใช้ Group ID เดียวกัน (และ passphrase เดียวกัน) จะเห็นและส่งไฟล์ถึงกันได้
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">Group</div>
+      <div id="grpStatus" class="dim" style="font-size:12.5px;margin-bottom:8px">not in a group yet</div>
+      <div id="grpActions" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn" id="grpCreate" type="button">Create a new group</button>
+        <span class="dim" style="font-size:12px">or join one:</span>
+        <input type="text" id="groupId" maxlength="6" inputmode="numeric" placeholder="6-digit id" style="width:120px" />
+        <button class="btn ghost" id="grpJoin" type="button">Request to join</button>
       </div>
+      <div id="grpMember" style="display:none;gap:8px;align-items:center">
+        <button class="btn ghost" id="grpLeave" type="button">Leave group</button>
+        <button class="btn ghost" id="grpMembers" type="button">Members…</button>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        The relay assigns the number when a group is created. Joining sends a request that the group's head approves from their WhisperDrop — nobody can enter a group just by knowing the number.
+      </div>
+      <div id="grpList" class="result" style="display:none"></div>
     </div>
     <div style="margin-top:12px">
       <input type="password" id="pairSecret" placeholder="Pairing passphrase (same on trusted devices)" autocomplete="off" />
@@ -174,11 +184,85 @@
     group: cfg.group_id || '',
   };
   $('relay').value = cfg.tunnel.relay;
-  $('groupId').value = state.group;
-  $('groupId').oninput = (e) => {
-    e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6);
-    state.group = e.target.value;
+  $('groupId').oninput = (e) => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); };
+
+  // ---- group membership (relay-issued ids, head-approved joins) ----
+  let pollTimer = null;
+  function renderGroup(ts) {
+    state.group = ts.group || '';
+    const member = !!(ts.group && ts.role);
+    $('grpActions').style.display = member ? 'none' : 'flex';
+    $('grpMember').style.display = member ? 'flex' : 'none';
+    $('grpMembers').style.display = member ? '' : 'none';
+    if (member) {
+      $('grpStatus').innerHTML = `<span class="ok">✓</span> in group <b style="color:#64d2ff;font-family:ui-monospace;font-size:15px">${ts.group}</b> as <b>${ts.role}</b>` +
+        (ts.role === 'head' ? ' — share this number; you approve who joins' : '') +
+        `<br><span class="dim">link: ${ts.status || '…'}</span>`;
+    } else if (ts.pending_request) {
+      $('grpStatus').innerHTML = `<span class="dim">⏳ waiting for the head of group <b>${ts.group}</b> to approve this device… (keeps checking)</span>`;
+      if (!pollTimer) pollTimer = setInterval(pollJoin, 4000);
+    } else {
+      $('grpStatus').innerHTML = '<span class="dim">not in a group yet</span>';
+    }
+  }
+  async function refreshGroup() {
+    try { renderGroup(await invoke('tunnel_status')); } catch (e) { dbg('tunnel_status ' + e); }
+  }
+  async function pollJoin() {
+    try {
+      const r = await invoke('group_join_status');
+      if (r.status === 'approved') { clearInterval(pollTimer); pollTimer = null; $('r2').innerHTML = '<span class="ok">✓ approved — you are in the group</span>'; }
+      if (r.status === 'denied')   { clearInterval(pollTimer); pollTimer = null; $('r2').innerHTML = '<span class="bad">✗ the group head denied this device</span>'; }
+    } catch (e) { dbg('join poll ' + e); }
+    refreshGroup();
+  }
+  $('grpCreate').onclick = async () => {
+    $('grpCreate').disabled = true; $('r2').innerHTML = '<span class="dim">asking the relay for a new group…</span>';
+    try {
+      const g = await invoke('group_create');
+      $('tunEn').checked = true; state.tunnel.enabled = true;
+      $('r2').innerHTML = `<span class="ok">✓ group <b>${g}</b> created — you are its head. Enter this number on your other devices and approve them here.</span>`;
+    } catch (e) { $('r2').innerHTML = `<span class="bad">✗ ${e}</span>`; }
+    $('grpCreate').disabled = false; refreshGroup();
   };
+  $('grpJoin').onclick = async () => {
+    const g = $('groupId').value;
+    if (!/^\d{6}$/.test(g)) { $('r2').innerHTML = '<span class="bad">✗ enter the 6-digit group id</span>'; return; }
+    $('grpJoin').disabled = true; $('r2').innerHTML = '<span class="dim">⏳ request sent — waiting for the group head to approve (they see it in their drop zone)…</span>';
+    try {
+      const r = await invoke('group_join', { group: g });
+      if (r.status === 'approved') { $('tunEn').checked = true; state.tunnel.enabled = true; $('r2').innerHTML = '<span class="ok">✓ approved — you are in the group</span>'; }
+      else if (r.status === 'denied') $('r2').innerHTML = '<span class="bad">✗ the group head denied this device</span>';
+      else $('r2').innerHTML = '<span class="dim">⏳ still waiting — you can close this window; the app keeps checking</span>';
+    } catch (e) { $('r2').innerHTML = `<span class="bad">✗ ${e}</span>`; }
+    $('grpJoin').disabled = false; refreshGroup();
+  };
+  $('grpLeave').onclick = async () => {
+    try { await invoke('group_leave'); $('r2').innerHTML = '<span class="dim">left the group</span>'; } catch (e) { $('r2').innerHTML = `<span class="bad">✗ ${e}</span>`; }
+    $('grpList').style.display = 'none'; refreshGroup();
+  };
+  $('grpMembers').onclick = async () => {
+    const box = $('grpList'); box.style.display = ''; box.innerHTML = '<span class="dim">loading…</span>';
+    try {
+      const [members, pending] = await Promise.all([invoke('group_members'), state.role === 'head' ? invoke('group_pending').catch(() => []) : []]);
+      const isHead = (await invoke('tunnel_status')).role === 'head';
+      let html = members.map(m => `<div>${m.online ? '<span class="ok">●</span>' : '<span class="dim">○</span>'} <b>${m.name}</b> <span class="dim">${m.device_id} · ${m.role}</span>` +
+        (isHead && m.role !== 'head' ? ` <a href="#" data-kick="${m.device_id}" style="color:#ff6961">remove</a>` : '') + '</div>').join('');
+      if (isHead && pending.length) html += '<div style="margin-top:6px"><b>Waiting for approval</b></div>' + pending.map(p =>
+        `<div>⏳ <b>${p.device_name}</b> <span class="dim">${p.device_id}</span> <a href="#" data-approve="${p.request_id}" style="color:#30d158">approve</a> · <a href="#" data-deny="${p.request_id}" style="color:#ff6961">deny</a></div>`).join('');
+      box.innerHTML = html || '<span class="dim">no members</span>';
+      box.querySelectorAll('a').forEach(a => a.onclick = async (ev) => {
+        ev.preventDefault();
+        try {
+          if (a.dataset.kick) await invoke('group_kick', { deviceId: a.dataset.kick });
+          if (a.dataset.approve) await invoke('group_approve', { requestId: a.dataset.approve, approved: true });
+          if (a.dataset.deny) await invoke('group_approve', { requestId: a.dataset.deny, approved: false });
+        } catch (e) { dbg('member action ' + e); }
+        $('grpMembers').onclick();
+      });
+    } catch (e) { box.innerHTML = `<span class="bad">✗ ${e}</span>`; }
+  };
+  refreshGroup();
   $('receiveDir').value = cfg.receive_dir || '';
   $('devid').textContent = cfg.tunnel.device_id;
   $('pairSecret').value = cfg.tunnel.shared_secret || '';
@@ -237,7 +321,7 @@
       return;
     }
     if (!/^\d{6}$/.test(state.group)) {
-      $('r2').innerHTML = '<span class="bad">✗ enter the 6-digit Group ID first</span>';
+      $('r2').innerHTML = '<span class="bad">✗ create or join a group first</span>';
       return;
     }
     $('r2').innerHTML = '<span class="dim">connecting…</span>';
@@ -260,7 +344,7 @@
     $('sum').innerHTML =
       `${mark(state.net)} &nbsp;Local network — ${state.net ? state.net.ip : 'unknown'}<br>` +
       `${mark(state.tunnel.ok === true || state.tunnel.skipped)} &nbsp;Tunnel — ${state.tunnel.enabled ? 'enabled (' + state.tunnel.relay + ')' : 'disabled (LAN only)'}<br>` +
-      `${mark(true)} &nbsp;Group — <b>${state.group || '(ยังไม่ได้กรอก)'}</b><br>` +
+      `${mark(!state.tunnel.enabled || state.group)} &nbsp;Group — <b>${state.group || 'none'}</b><br>` +
       `${mark(!state.tunnel.enabled || $('pairSecret').value.trim())} &nbsp;Tunnel encryption — ${state.tunnel.enabled ? ($('pairSecret').value.trim() ? 'end-to-end encrypted' : 'pairing passphrase required') : 'not applicable'}<br>` +
       `${mark(true)} &nbsp;Drop zone — <b>${state.position}</b> edge<br>` +
       `${mark(true)} &nbsp;Firewall — not required on macOS`;
@@ -275,14 +359,13 @@
         throw new Error('enter the same pairing passphrase on every trusted tunnel device');
       }
       if (state.tunnel.enabled && !/^\d{6}$/.test(state.group)) {
-        throw new Error('enter the 6-digit Group ID shared by your devices (step 2)');
+        throw new Error('create or join a group in step 2 (or disable the tunnel)');
       }
       await invoke('wizard_finish', {
         position: state.position,
         tunnelEnabled: state.tunnel.enabled,
         relay: state.tunnel.relay,
         deviceId: cfg.tunnel.device_id,
-        groupId: state.group,
         sharedSecret: $('pairSecret').value,
         knownTunnelDevices: $('tunnelPeers').value,
         receiveDir: $('receiveDir').value.trim(),

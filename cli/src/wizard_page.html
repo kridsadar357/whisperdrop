@@ -82,12 +82,22 @@
     <div style="margin-top:12px" class="dim">This device's identity:
       <b id="devid" style="color:#64d2ff;font-family:ui-monospace"></b></div>
     <div style="margin-top:12px">
-      <div style="font-size:13px;font-weight:700;margin-bottom:6px">Group ID (6 digits)</div>
-      <input type="text" id="groupId" maxlength="6" inputmode="numeric"
-        placeholder="e.g. 482913 — the same number on every device that should reach each other" />
-      <div class="dim" style="font-size:11px;margin-top:4px">
-        Devices sharing this Group ID (and the passphrase) see each other and can send files through the tunnel.
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">Group</div>
+      <div id="grpStatus" class="dim" style="font-size:12.5px;margin-bottom:8px">not in a group yet</div>
+      <div id="grpActions" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button id="grpCreate" type="button">Create a new group</button>
+        <span class="dim" style="font-size:12px">or join one:</span>
+        <input type="text" id="groupId" maxlength="6" inputmode="numeric" placeholder="6-digit id" style="width:120px" />
+        <button class="ghost" id="grpJoin" type="button">Request to join</button>
       </div>
+      <div id="grpMember" style="display:none;gap:8px;align-items:center">
+        <button class="ghost" id="grpLeave" type="button">Leave group</button>
+        <button class="ghost" id="grpMembers" type="button">Members…</button>
+      </div>
+      <div class="dim" style="font-size:11px;margin-top:6px">
+        The relay assigns the number when a group is created. Joining sends a request that the group's head approves on their WhisperDrop — nobody can enter a group just by knowing the number.
+      </div>
+      <div id="grpList" class="result" style="display:none"></div>
     </div>
     <div style="margin-top:12px">
       <input type="password" id="pairSecret" placeholder="Pairing passphrase (same on trusted devices)" autocomplete="off" />
@@ -164,8 +174,8 @@
     $('tunEn').checked = st.tunnel.enabled;
     $('receiveDir').value = st.receive_dir || '';
     $('pairSecret').value = st.tunnel.shared_secret || '';
-    $('groupId').value = st.group_id || '';
     $('groupId').oninput = (e) => { e.target.value = e.target.value.replace(/\D/g, '').slice(0, 6); };
+    refreshGroup();
     $('tunnelPeers').value = (st.known_tunnel_devices || []).join(', ');
     tunnelEnabled = st.tunnel.enabled;
     position = st.position;
@@ -182,6 +192,79 @@
     document.querySelectorAll('.poscard').forEach(c =>
       c.classList.toggle('sel', c.dataset.pos === p));
   }
+
+  // ---- group membership (relay-issued ids, head-approved joins) ----
+  let groupState = { group: '', role: '', member: false, pending_request: '' };
+  let pollTimer = null;
+  const post = async (url, body) => (await fetch(url, { method: 'POST', body: JSON.stringify(body || {}) })).json();
+  function renderGroup(ts) {
+    groupState = ts;
+    const member = !!(ts.group && ts.member);
+    $('grpActions').style.display = member ? 'none' : 'flex';
+    $('grpMember').style.display = member ? 'flex' : 'none';
+    if (member) {
+      $('grpStatus').innerHTML = `<span class="ok">✓</span> in group <b style="color:#64d2ff;font-family:ui-monospace;font-size:15px">${ts.group}</b> as <b>${ts.role}</b>` +
+        (ts.role === 'head' ? ' — share this number; you approve who joins' : '') + `<br><span class="dim">link: ${ts.status || '…'}</span>`;
+    } else if (ts.pending_request) {
+      $('grpStatus').innerHTML = `<span class="dim">⏳ waiting for the head of group <b>${ts.group}</b> to approve this device… (keeps checking)</span>`;
+      if (!pollTimer) pollTimer = setInterval(pollJoin, 4000);
+    } else {
+      $('grpStatus').innerHTML = '<span class="dim">not in a group yet</span>';
+    }
+    summary();
+  }
+  async function refreshGroup() {
+    try { renderGroup(await (await fetch('/api/tunnel/status')).json()); } catch (e) {}
+  }
+  async function pollJoin() {
+    try {
+      const j = await (await fetch('/api/group/join-status')).json();
+      if (j.ok && j.result.status === 'approved') { clearInterval(pollTimer); pollTimer = null; $('r2').innerHTML = '<span class="ok">✓ approved — you are in the group</span>'; }
+      if (j.ok && j.result.status === 'denied')   { clearInterval(pollTimer); pollTimer = null; $('r2').innerHTML = '<span class="bad">✗ the group head denied this device</span>'; }
+    } catch (e) {}
+    refreshGroup();
+  }
+  $('grpCreate').onclick = async () => {
+    $('grpCreate').disabled = true; $('r2').innerHTML = '<span class="dim">asking the relay for a new group…</span>';
+    const j = await post('/api/group/create');
+    if (j.ok) { $('tunEn').checked = true; tunnelEnabled = true; $('r2').innerHTML = `<span class="ok">✓ group <b>${j.result}</b> created — you are its head. Enter this number on your other devices and approve them here.</span>`; }
+    else $('r2').innerHTML = `<span class="bad">✗ ${j.err}</span>`;
+    $('grpCreate').disabled = false; refreshGroup();
+  };
+  $('grpJoin').onclick = async () => {
+    const g = $('groupId').value;
+    if (!/^\d{6}$/.test(g)) { $('r2').innerHTML = '<span class="bad">✗ enter the 6-digit group id</span>'; return; }
+    $('grpJoin').disabled = true; $('r2').innerHTML = '<span class="dim">⏳ request sent — waiting for the group head to approve…</span>';
+    const j = await post('/api/group/join', { group: g });
+    if (j.ok && j.result.status === 'approved') { $('tunEn').checked = true; tunnelEnabled = true; $('r2').innerHTML = '<span class="ok">✓ approved — you are in the group</span>'; }
+    else if (j.ok && j.result.status === 'denied') $('r2').innerHTML = '<span class="bad">✗ the group head denied this device</span>';
+    else if (j.ok) $('r2').innerHTML = '<span class="dim">⏳ still waiting — you can close this page; WhisperDrop keeps checking</span>';
+    else $('r2').innerHTML = `<span class="bad">✗ ${j.err}</span>`;
+    $('grpJoin').disabled = false; refreshGroup();
+  };
+  $('grpLeave').onclick = async () => { await post('/api/group/leave'); $('grpList').style.display = 'none'; $('r2').innerHTML = '<span class="dim">left the group</span>'; refreshGroup(); };
+  $('grpMembers').onclick = async () => {
+    const box = $('grpList'); box.style.display = ''; box.innerHTML = '<span class="dim">loading…</span>';
+    const m = await post('/api/group/query', { frame: { type: 'members' }, reply: 'members' });
+    if (!m.ok) { box.innerHTML = `<span class="bad">✗ ${m.err}</span>`; return; }
+    const isHead = groupState.role === 'head';
+    let html = (m.result.members || []).map(x => `<div>${x.online ? '<span class="ok">●</span>' : '<span class="dim">○</span>'} <b>${x.name}</b> <span class="dim">${x.device_id} · ${x.role}</span>` +
+      (isHead && x.role !== 'head' ? ` <a href="#" data-kick="${x.device_id}" style="color:#ff6961">remove</a>` : '') + '</div>').join('');
+    if (isHead) {
+      const p = await post('/api/group/query', { frame: { type: 'pending' }, reply: 'pending' });
+      const list = p.ok ? (p.result.requests || []) : [];
+      if (list.length) html += '<div style="margin-top:6px"><b>Waiting for approval</b></div>' + list.map(r =>
+        `<div>⏳ <b>${r.device_name}</b> <span class="dim">${r.device_id}</span> <a href="#" data-approve="${r.request_id}" style="color:#30d158">approve</a> · <a href="#" data-deny="${r.request_id}" style="color:#ff6961">deny</a></div>`).join('');
+    }
+    box.innerHTML = html || '<span class="dim">no members</span>';
+    box.querySelectorAll('a').forEach(a => a.onclick = async (ev) => {
+      ev.preventDefault();
+      if (a.dataset.kick) await post('/api/group/query', { frame: { type: 'kick', device_id: a.dataset.kick }, reply: 'ok' });
+      if (a.dataset.approve) await post('/api/group/query', { frame: { type: 'approve', request_id: a.dataset.approve, approved: true }, reply: 'ok' });
+      if (a.dataset.deny) await post('/api/group/query', { frame: { type: 'approve', request_id: a.dataset.deny, approved: false }, reply: 'ok' });
+      $('grpMembers').onclick();
+    });
+  };
 
   $('tunEn').onchange = (e) => { tunnelEnabled = e.target.checked; summary(); };
   $('relay').oninput = (e) => { summary(); };
@@ -208,6 +291,7 @@
     $('sum').innerHTML =
       `• Position: <b>${position}</b> edge<br>` +
       `• Tunnel: <b>${tun ? 'enabled — ' + $('relay').value : 'disabled (LAN only)'}</b><br>` +
+      `• Group: <b>${groupState.member ? groupState.group + ' (' + groupState.role + ')' : 'none'}</b><br>` +
       `• Encryption: <b>${tun ? ($('pairSecret').value.trim() ? 'end-to-end encrypted' : 'pairing passphrase required') : 'not applicable'}</b><br>` +
       `• Identity: <b>${$('devid').textContent}</b>`;
   }
@@ -217,8 +301,8 @@
       $('r5').innerHTML = '<span class="bad">Enter the same pairing passphrase on every trusted tunnel device.</span>';
       return;
     }
-    if ($('tunEn').checked && !/^\d{6}$/.test($('groupId').value)) {
-      $('r5').innerHTML = '<span class="bad">Enter the 6-digit Group ID shared by your devices.</span>';
+    if ($('tunEn').checked && !groupState.member) {
+      $('r5').innerHTML = '<span class="bad">Create or join a group first (or disable the tunnel).</span>';
       return;
     }
     tunnelEnabled = $('tunEn').checked;
@@ -227,7 +311,6 @@
       body: JSON.stringify({
         position, tunnel_enabled: tunnelEnabled,
         relay: $('relay').value.trim(), device_id: $('devid').textContent,
-        group_id: $('groupId').value,
         receive_dir: $('receiveDir').value.trim(), shared_secret: $('pairSecret').value,
         tunnel_peers: $('tunnelPeers').value.trim()
       })

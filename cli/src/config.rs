@@ -12,6 +12,16 @@ pub struct TunnelCfg {
     /// Shared manually between trusted devices; it never leaves either peer.
     #[serde(default)]
     pub shared_secret: String,
+    /// Secret issued by the relay when this device was admitted to the
+    /// group (or created it). Never shared between devices.
+    #[serde(default)]
+    pub member_token: String,
+    /// "head" | "member" | "" — as reported by the relay.
+    #[serde(default)]
+    pub role: String,
+    /// A join request still waiting for the head's decision.
+    #[serde(default)]
+    pub pending_request: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -57,6 +67,9 @@ impl Default for Config {
                 relay: "wss://riki-api.online/ws".into(),
                 device_id: default_device_id(),
                 shared_secret: String::new(),
+                member_token: String::new(),
+                role: String::new(),
+                pending_request: String::new(),
             },
             group_id: String::new(),
             receive_dir: default_receive_dir(),

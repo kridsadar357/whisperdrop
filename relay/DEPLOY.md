@@ -1,7 +1,10 @@
 # Deploying the relay to riki-api.online
 
-The relay is a tiny WebSocket broker: devices register with a 6-digit group
-id; every frame is forwarded to the other members of that group.
+The relay is a small WebSocket broker with a persistent group registry
+(`GROUPS_FILE`, JSON): it issues group numbers and per-device member tokens,
+relays join requests to the group's head, and forwards transfer frames only
+between registered members of the same group. The frame protocol is
+documented at the top of `relay/src/main.rs`.
 
 ## Current deployment (since 2026-09-18)
 
@@ -12,7 +15,8 @@ machine). On that host:
 | piece | where |
 |---|---|
 | binary (static musl build) | `/opt/whisperdrop-relay/whisperdrop-relay` |
-| service | `systemctl status whisperdrop-relay` — `PORT=8765`, `Restart=always`, `DynamicUser` |
+| service | `systemctl status whisperdrop-relay` — `PORT=8765`, `GROUPS_FILE=/var/lib/whisperdrop-relay/groups.json` (`StateDirectory`), `Restart=always`, `DynamicUser` |
+| registry | `/var/lib/whisperdrop-relay/groups.json` — back it up; losing it means every device must re-create/re-join its group |
 | nginx site | `/etc/nginx/sites-available/riki-api.online` — `/ws` → `127.0.0.1:8765` (websocket upgrade, 1h read timeout), `/health` → `relay-ok`, `/whisperdrop/` static (update manifest) |
 | TLS | Let's Encrypt via `certbot --nginx -d riki-api.online` (auto-renew) |
 
@@ -75,16 +79,11 @@ For nginx, ensure upgrade headers are retained:
 Open two terminals and use distinct ids. In terminal A:
 
     wscat -c wss://riki-api.online/ws
-    > {"type":"register","id":"relay-test-a","group":"999999"}
-    > {"type":"devices"}
-    > {"type":"probe","from":"relay-test-a","group":"999999"}
+    > {"type":"ping"}                     -> {"type":"pong",...}
+    > {"type":"create_group","device_id":"a","device_name":"A"}   -> group + token
+    # reconnect, then:
+    > {"type":"register","group":"<group>","id":"a","token":"<token>"} -> registered
 
-In terminal B:
-
-    wscat -c wss://riki-api.online/ws
-    > {"type":"register","id":"relay-test-b","group":"999999"}
-
-A must get `{"type":"devices","ids":["relay-test-b"]}` and B must receive
-the `probe` frame from A. Registering without a `group` is dropped. A successful WebSocket
+Registering without a valid token is refused with an `error` frame. A successful WebSocket
 upgrade alone is not sufficient: a `devices` reply and routed frame must both
 work before WhisperDrop tunnel transfers can work.

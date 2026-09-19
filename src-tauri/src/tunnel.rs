@@ -16,6 +16,75 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
 pub static TUNNEL_PEERS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// Human-readable link state for the UI: "connecting", "online (head)",
+/// "not a member", "relay unreachable: …".
+pub static TUNNEL_STATUS: Mutex<String> = Mutex::new(String::new());
+/// Set when the relay rejected our token — the loop stops reconnecting
+/// until the config changes (apply_config respawns it).
+static MEMBERSHIP_REJECTED: AtomicBool = AtomicBool::new(false);
+
+pub fn status() -> String {
+    TUNNEL_STATUS.lock().unwrap().clone()
+}
+fn set_status(s: impl Into<String>) {
+    *TUNNEL_STATUS.lock().unwrap() = s.into();
+}
+
+type Tx = futures_util::stream::SplitSink<
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+type Rx = futures_util::stream::SplitStream<
+    WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// `register` frame carrying this device's member token.
+fn register_frame(group: &str) -> Message {
+    let cfg = get_cfg();
+    Message::text(
+        json!({"type":"register","group":group,"id":cfg.tunnel.device_id,"token":cfg.tunnel.member_token})
+            .to_string(),
+    )
+}
+
+/// Read frames until the relay accepts (`registered`) or refuses (`error`).
+async fn await_registered(rx: &mut Rx) -> Result<serde_json::Value, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, rx.next())
+            .await
+            .map_err(|_| "relay did not answer the registration".to_string())?
+            .ok_or("relay closed the connection".to_string())?
+            .map_err(|e| format!("relay read: {e}"))?;
+        let Message::Text(t) = msg else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+        match v["type"].as_str() {
+            Some("registered") => return Ok(v),
+            Some("error") => return Err(v["err"].as_str().unwrap_or("rejected by relay").to_string()),
+            _ => {}
+        }
+    }
+}
+
+/// Read frames until one of `types` arrives (or the timeout).
+async fn await_type(rx: &mut Rx, types: &[&str], secs: u64) -> Result<serde_json::Value, String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, rx.next())
+            .await
+            .map_err(|_| "timed out waiting for the relay".to_string())?
+            .ok_or("relay closed the connection".to_string())?
+            .map_err(|e| format!("relay read: {e}"))?;
+        let Message::Text(t) = msg else { continue };
+        let v: serde_json::Value = serde_json::from_str(&t).map_err(|e| e.to_string())?;
+        if v["type"].as_str() == Some("error") {
+            return Err(v["err"].as_str().unwrap_or("relay error").to_string());
+        }
+        if types.contains(&v["type"].as_str().unwrap_or("")) {
+            return Ok(v);
+        }
+    }
+}
 static IN_SENT: AtomicU64 = AtomicU64::new(0);
 static IN_TOTAL: AtomicU64 = AtomicU64::new(1);
 static IN_NAME: Mutex<String> = Mutex::new(String::new());
@@ -185,11 +254,10 @@ pub async fn send_over_tunnel(
 ) -> Result<u64, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    tx.send(Message::text(
-        json!({"type":"register","group":group,"id":self_id}).to_string(),
-    ))
-    .await
-    .map_err(|e| format!("register: {e}"))?;
+    tx.send(register_frame(group))
+        .await
+        .map_err(|e| format!("register: {e}"))?;
+    await_registered(&mut rx).await?;
 
     let name = std::path::Path::new(path)
         .file_name()
@@ -203,7 +271,7 @@ pub async fn send_over_tunnel(
     let encrypted = tunnel_key().is_some();
 
     tx.send(Message::text(
-        json!({"type":"begin","group":group,"from":self_id,"name":name,"size":total,"encrypted":encrypted}).to_string(),
+        json!({"type":"begin","group":group,"from":self_id,"reply_to":get_cfg().tunnel.device_id,"name":name,"size":total,"encrypted":encrypted}).to_string(),
     ))
     .await
     .map_err(|e| format!("send begin: {e}"))?;
@@ -237,9 +305,12 @@ pub async fn send_over_tunnel(
     .await
     .map_err(|e| format!("send end: {e}"))?;
 
-    // wait briefly for the receiving side's confirmation frames (best effort)
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(400), rx.next()).await;
-    Ok(total)
+    // wait for a receiver to confirm (or report a decrypt failure)
+    match await_type(&mut rx, &["complete"], 30).await {
+        Ok(_) => Ok(total),
+        Err(e) if e.starts_with("timed out") => Err("no device in the group confirmed receipt within 30 seconds".into()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Persistent receive loop — abort + respawn when the tunnel config changes.
@@ -247,24 +318,12 @@ pub async fn send_over_tunnel(
 pub async fn devices(relay: &str, group: &str, self_id: &str) -> Result<Vec<String>, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    tx.send(Message::text(
-        json!({"type":"register","group":group,"id":self_id}).to_string(),
-    ))
-    .await
-    .map_err(|e| e.to_string())?;
+    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    await_registered(&mut rx).await?;
     tx.send(Message::text(json!({"type":"devices"}).to_string()))
         .await
         .map_err(|e| e.to_string())?;
-    let reply = tokio::time::timeout(std::time::Duration::from_secs(6), rx.next())
-        .await
-        .map_err(|_| "devices request timed out".to_string())?;
-    let msg = reply
-        .ok_or("no devices reply from relay".to_string())?
-        .map_err(|e| format!("relay read: {e}"))?;
-    let text = msg
-        .into_text()
-        .map_err(|_| "devices reply was not text".to_string())?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{e}"))?;
+    let v = await_type(&mut rx, &["devices"], 6).await?;
     if v["type"] == "devices" {
         let me = self_id;
         let ids: Vec<String> = v["ids"]
@@ -284,26 +343,54 @@ pub async fn devices(relay: &str, group: &str, self_id: &str) -> Result<Vec<Stri
 
 /// alias kept for the wizard's check flow
 pub async fn check_relay(relay: &str, group: &str) -> Result<Vec<String>, String> {
+    if group.is_empty() || get_cfg().tunnel.member_token.is_empty() {
+        return ping(relay).await.map(|_| Vec::new());
+    }
     devices(relay, group, &format!("check-{}", std::process::id())).await
+}
+
+/// Membership-less reachability probe.
+pub async fn ping(relay: &str) -> Result<(), String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(json!({"type":"ping"}).to_string())).await.map_err(|e| e.to_string())?;
+    await_type(&mut rx, &["pong"], 8).await.map(|_| ())
 }
 
 /// Persistent receive loop — abort + respawn when the tunnel config changes.
 pub async fn receive_loop(relay: String, group: String, self_id: String, app: AppHandle) {
+    MEMBERSHIP_REJECTED.store(false, Ordering::Relaxed);
+    if group.is_empty() || get_cfg().tunnel.member_token.is_empty() {
+        set_status("not in a group — create or join one in Preferences");
+        println!("[tunnel] no group membership yet — tunnel idle");
+        return;
+    }
     loop {
         println!("[tunnel] connecting {relay} as {self_id} (group {group})…");
+        set_status("connecting");
         match connect(&relay).await {
             Ok((ws, _)) => {
                 println!("[tunnel] connected ✓");
                 let (mut tx, mut rx) = ws.split();
-                if tx
-                    .send(Message::text(
-                        json!({"type":"register","group":group,"id":self_id}).to_string(),
-                    ))
-                    .await
-                    .is_err()
-                {
+                if tx.send(register_frame(&group)).await.is_err() {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
+                }
+                match await_registered(&mut rx).await {
+                    Ok(v) => {
+                        let role = v["role"].as_str().unwrap_or("member").to_string();
+                        set_status(format!("online ({role})"));
+                        use tauri::Emitter;
+                        let _ = app.emit("tunnel-status", json!({"status": status(), "role": role, "members": v["members"]}));
+                    }
+                    Err(e) => {
+                        println!("[tunnel] registration refused: {e}");
+                        set_status(format!("not a member: {e}"));
+                        use tauri::Emitter;
+                        let _ = app.emit("tunnel-status", json!({"status": status()}));
+                        MEMBERSHIP_REJECTED.store(true, Ordering::Relaxed);
+                        return; // wait for a config change instead of hammering the relay
+                    }
                 }
                 // poll group membership so later devices appear in the picker;
                 // pings + a stale timeout evict zombie links (NAT/CF can drop
@@ -335,11 +422,93 @@ pub async fn receive_loop(relay: String, group: String, self_id: String, app: Ap
                     }
                 }
                 println!("[tunnel] disconnected — retrying in 3s");
+                set_status("reconnecting");
             }
-            Err(e) => println!("[tunnel] connect failed: {e} — retrying in 3s"),
+            Err(e) => {
+                println!("[tunnel] connect failed: {e} — retrying in 3s");
+                set_status(format!("relay unreachable: {e}"));
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
+}
+
+// ------------------------------------------------------------ group admin
+/// Outcome of a join request.
+#[derive(serde::Serialize, Clone, Debug)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum JoinOutcome {
+    Approved { token: String },
+    Denied,
+    Pending { request_id: String },
+}
+
+fn join_outcome(v: &serde_json::Value) -> JoinOutcome {
+    match v["type"].as_str() {
+        Some("join_result") => {
+            if v["approved"].as_bool().unwrap_or(false) {
+                JoinOutcome::Approved { token: v["token"].as_str().unwrap_or("").to_string() }
+            } else {
+                JoinOutcome::Denied
+            }
+        }
+        _ => JoinOutcome::Pending { request_id: v["request_id"].as_str().unwrap_or("").to_string() },
+    }
+}
+
+/// Ask the relay for a brand-new group; this device becomes its head.
+pub async fn group_create(relay: &str, device_id: &str, device_name: &str) -> Result<(String, String), String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(
+        json!({"type":"create_group","device_id":device_id,"device_name":device_name}).to_string(),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
+    let v = await_type(&mut rx, &["group_created"], 10).await?;
+    Ok((
+        v["group"].as_str().unwrap_or("").to_string(),
+        v["token"].as_str().unwrap_or("").to_string(),
+    ))
+}
+
+/// Request to join `group`; waits up to `wait_secs` for the head's decision.
+pub async fn group_join(relay: &str, group: &str, device_id: &str, device_name: &str, wait_secs: u64) -> Result<JoinOutcome, String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(
+        json!({"type":"join_request","group":group,"device_id":device_id,"device_name":device_name}).to_string(),
+    ))
+    .await
+    .map_err(|e| e.to_string())?;
+    let pending = await_type(&mut rx, &["join_pending"], 10).await?;
+    let request_id = pending["request_id"].as_str().unwrap_or("").to_string();
+    match await_type(&mut rx, &["join_result"], wait_secs).await {
+        Ok(v) => Ok(join_outcome(&v)),
+        Err(_) => Ok(JoinOutcome::Pending { request_id }),
+    }
+}
+
+/// Re-check a request made earlier (the head may have decided while we were away).
+pub async fn group_join_status(relay: &str, group: &str, request_id: &str) -> Result<JoinOutcome, String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(Message::text(json!({"type":"join_status","group":group,"request_id":request_id}).to_string()))
+        .await
+        .map_err(|e| e.to_string())?;
+    let v = await_type(&mut rx, &["join_result", "join_pending"], 10).await?;
+    Ok(join_outcome(&v))
+}
+
+/// One-shot authenticated request: register with our token, send `frame`,
+/// return the first reply of one of `reply_types`.
+pub async fn group_query(relay: &str, group: &str, frame: serde_json::Value, reply_types: &[&str]) -> Result<serde_json::Value, String> {
+    let (ws, _) = connect(relay).await?;
+    let (mut tx, mut rx) = ws.split();
+    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    await_registered(&mut rx).await?;
+    tx.send(Message::text(frame.to_string())).await.map_err(|e| e.to_string())?;
+    await_type(&mut rx, reply_types, 10).await
 }
 
 async fn handle_frame(
@@ -355,6 +524,26 @@ async fn handle_frame(
         Err(_) => return,
     };
     match v["type"].as_str().unwrap_or("") {
+        "join_request" => {
+            // someone wants into our group — the head decides in the drop zone
+            use tauri::Emitter;
+            let name = v["device_name"].as_str().unwrap_or("a device");
+            println!("[tunnel] join request from {name} ({})", v["device_id"].as_str().unwrap_or("?"));
+            let _ = app.emit("tunnel-join-request", v.clone());
+            crate::tray::notify(app, "WhisperDrop — join request", &format!("{name} wants to join group {}", v["group"].as_str().unwrap_or("")));
+        }
+        "join_decided" => {
+            use tauri::Emitter;
+            let _ = app.emit("tunnel-join-decided", v.clone());
+        }
+        "registered" | "ok" | "members" | "pending" => {}
+        "error" => {
+            let e = v["err"].as_str().unwrap_or("relay error");
+            println!("[tunnel] relay: {e}");
+            set_status(format!("relay: {e}"));
+            use tauri::Emitter;
+            let _ = app.emit("tunnel-status", json!({"status": status()}));
+        }
         "devices" => {
             let me = get_cfg().tunnel.device_id;
             if let Some(arr) = v["ids"].as_array() {
@@ -374,6 +563,12 @@ async fn handle_frame(
             IN_SENT.store(0, Ordering::Relaxed);
             IN_ENCRYPTED.store(v["encrypted"].as_bool().unwrap_or(false), Ordering::Relaxed);
             *IN_NONCE.lock().unwrap() = v["nonce"].as_str().unwrap_or("").to_string();
+            // who to confirm to when the file has landed (sender's device id)
+            *IN_REPLY_TO.lock().unwrap() = v["reply_to"]
+                .as_str()
+                .or_else(|| v["from"].as_str())
+                .unwrap_or("")
+                .to_string();
             IN_FAILED.store(false, Ordering::Relaxed);
             let mut dir = crate::server::receive_dir();
             std::fs::create_dir_all(&dir).ok();
