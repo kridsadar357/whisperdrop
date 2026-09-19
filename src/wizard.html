@@ -236,10 +236,14 @@
       show(3);
       return;
     }
+    if (!/^\d{6}$/.test(state.group)) {
+      $('r2').innerHTML = '<span class="bad">✗ enter the 6-digit Group ID first</span>';
+      return;
+    }
     $('r2').innerHTML = '<span class="dim">connecting…</span>';
     try {
       const ids = await Promise.race([
-        invoke('wizard_check_tunnel', { relay: state.tunnel.relay, deviceId: cfg.tunnel.device_id }),
+        invoke('wizard_check_tunnel', { relay: state.tunnel.relay, groupId: state.group }),
         new Promise((_, reject) => setTimeout(() => reject(new Error('relay test timed out after 15 seconds')), 15000))
       ]);
       state.tunnel.ok = true;
