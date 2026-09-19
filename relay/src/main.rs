@@ -21,6 +21,7 @@
 //!   members                                      -> members {members:[{device_id,name,role,online}]}
 //!   leave                                        -> ok
 //!   <anything else>                              -> forwarded to the other online members
+//!                (with "to": <device_id> only to that device; complete/error acks also reach send-only sessions)
 //! After register (head only):
 //!   pending                                      -> pending {requests:[{request_id,device_id,device_name,ts}]}
 //!   approve {request_id, approved}               -> ok   (requester gets join_result)
@@ -183,14 +184,16 @@ impl State {
     /// Where a transfer frame goes: addressed frames (`to`) reach every
     /// session of that device; broadcast frames reach the *listening*
     /// sessions of every other device (never the sender's own sessions).
-    fn targets(&self, group: &str, sender: &str, sender_key: u64, to: Option<&str>) -> Vec<Conn> {
+    /// `ack` frames (complete/error) also reach send-only sessions, which is
+    /// how an uploader learns its file landed; data frames never do.
+    fn targets(&self, group: &str, sender: &str, sender_key: u64, to: Option<&str>, ack: bool) -> Vec<Conn> {
         self.online
             .get(group)
             .map(|m| {
                 m.iter()
-                    .filter(|(k, c)| **k != sender_key && match to {
-                        Some(dev) => c.device_id == dev,
-                        None => c.listen && c.device_id != sender,
+                    .filter(|(k, c)| **k != sender_key && c.device_id != sender && match to {
+                        Some(dev) => c.device_id == dev && (c.listen || ack),
+                        None => c.listen,
                     })
                     .map(|(_, c)| c.clone())
                     .collect()
@@ -400,7 +403,7 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
     loop {
         tokio::select! {
             _ = ping.tick() => {
-                if last_seen.elapsed() > std::time::Duration::from_secs(45) {
+                if listen && last_seen.elapsed() > std::time::Duration::from_secs(90) {
                     println!("[!] {device_id} stale — dropping");
                     break;
                 }
@@ -492,10 +495,13 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
                             // (never back to the sender's own receive session);
                             // awaiting a full queue is the backpressure
                             let to = v["to"].as_str().map(str::to_string);
-                            let targets = shared.lock().await.targets(&group, &device_id, key, to.as_deref());
+                            let ack = matches!(v["type"].as_str(), Some("complete") | Some("error") | Some("progress"));
+                            let targets = shared.lock().await.targets(&group, &device_id, key, to.as_deref(), ack);
                             for c in targets {
                                 let _ = c.tx.send(Message::text(t.clone())).await;
                             }
+                            // a forward that waited on a slow receiver is not a dead peer
+                            last_seen = std::time::Instant::now();
                             None
                         }
                     };

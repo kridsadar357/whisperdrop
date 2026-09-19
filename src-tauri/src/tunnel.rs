@@ -273,12 +273,52 @@ fn clamp_mss(_stream: &tokio::net::TcpStream, _mss: u32) {}
 /// Stream a file through the relay to the whole group. Payloads are
 /// end-to-end encrypted per chunk (fresh nonce each); progress is reported
 /// through the returned watcher counter.
+/// Group member as reported by the relay.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct Member {
+    pub device_id: String,
+    pub name: String,
+    pub role: String,
+    pub online: bool,
+}
+/// Members of our group (refreshed by the receive loop every few seconds).
+pub static TUNNEL_MEMBERS: Mutex<Vec<Member>> = Mutex::new(Vec::new());
+
+fn update_members(list: &serde_json::Value) {
+    let me = get_cfg().tunnel.device_id;
+    let members: Vec<Member> = list
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    let id = m["device_id"].as_str()?.to_string();
+                    if id == me {
+                        return None;
+                    }
+                    Some(Member {
+                        device_id: id,
+                        name: m["name"].as_str().unwrap_or("").to_string(),
+                        role: m["role"].as_str().unwrap_or("member").to_string(),
+                        online: m["online"].as_bool().unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    *TUNNEL_PEERS.lock().unwrap() = members.iter().filter(|m| m.online).map(|m| m.device_id.clone()).collect();
+    *TUNNEL_MEMBERS.lock().unwrap() = members;
+}
+
+/// Stream a file through the relay: to one member (`to = Some(device_id)`)
+/// or to the whole group. Incoming frames are drained while uploading so
+/// pongs flow and a receiver's early `error` aborts the transfer.
 pub async fn send_over_tunnel(
     relay: &str,
     group: &str,
     self_id: &str,
     path: &str,
     sent: Arc<AtomicU64>,
+    to: Option<&str>,
 ) -> Result<u64, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
@@ -297,51 +337,85 @@ pub async fn send_over_tunnel(
         .map_err(|e| format!("read {path}: {e}"))?;
     let total = file.metadata().await.map_err(|e| e.to_string())?.len();
     let encrypted = tunnel_key().is_some();
+    let me = get_cfg().tunnel.device_id;
+
+    // reader task: acks/errors arrive here while we are busy sending
+    let (ack_tx, mut ack_rx) = tokio::sync::mpsc::unbounded_channel::<Result<(), String>>();
+    let reader = tokio::spawn(async move {
+        while let Some(m) = rx.next().await {
+            let Ok(Message::Text(t)) = m else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else { continue };
+            match v["type"].as_str() {
+                Some("complete") => { let _ = ack_tx.send(Ok(())); }
+                Some("error") => { let _ = ack_tx.send(Err(v["err"].as_str().unwrap_or("receiver error").to_string())); }
+                _ => {}
+            }
+        }
+        let _ = ack_tx.send(Err("relay closed the connection".into()));
+    });
+
+    let mut frame_base = json!({"group":group,"from":self_id,"reply_to":me});
+    if let Some(dev) = to {
+        frame_base["to"] = json!(dev);
+    }
+    let with = |mut base: serde_json::Value, extra: serde_json::Value| {
+        if let (Some(b), Some(e)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in e { b.insert(k.clone(), v.clone()); }
+        }
+        base
+    };
 
     tx.send(Message::text(
-        json!({"type":"begin","group":group,"from":self_id,"reply_to":get_cfg().tunnel.device_id,"name":name,"size":total,"encrypted":encrypted}).to_string(),
+        with(frame_base.clone(), json!({"type":"begin","name":name,"size":total,"encrypted":encrypted})).to_string(),
     ))
     .await
     .map_err(|e| format!("send begin: {e}"))?;
 
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; CHUNK];
-    let mut chunk_no: u64 = 0;
-    loop {
-        let n = file.read(&mut buf).await.map_err(|e| format!("read: {e}"))?;
+    let result: Result<(), String> = loop {
+        // an early error (busy receiver, wrong passphrase) stops the upload
+        if let Ok(r) = ack_rx.try_recv() {
+            if let Err(e) = r { break Err(e); }
+        }
+        let n = match file.read(&mut buf).await {
+            Ok(n) => n,
+            Err(e) => break Err(format!("read: {e}")),
+        };
         if n == 0 {
-            break;
+            break Ok(());
         }
         sent.fetch_add(n as u64, Ordering::Relaxed);
         let frame = match tunnel_key() {
-            Some(key) => {
-                let (sealed, nonce) = encrypt(&buf[..n], key)?;
-                json!({"type":"chunk","group":group,"from":self_id,"nonce":b64(&nonce),"b64":b64(&sealed)})
-            }
-            None => json!({"type":"chunk","group":group,"from":self_id,"b64":b64(&buf[..n])}),
+            Some(key) => match encrypt(&buf[..n], key) {
+                Ok((sealed, nonce)) => with(frame_base.clone(), json!({"type":"chunk","nonce":b64(&nonce),"b64":b64(&sealed)})),
+                Err(e) => break Err(e),
+            },
+            None => with(frame_base.clone(), json!({"type":"chunk","b64":b64(&buf[..n])})),
         };
-        tx.send(Message::text(frame.to_string()))
-            .await
-            .map_err(|e| format!("send chunk: {e}"))?;
-        chunk_no += 1;
-        let _ = chunk_no;
+        if let Err(e) = tx.send(Message::text(frame.to_string())).await {
+            break Err(format!("send chunk: {e}"));
+        }
+    };
+    if let Err(e) = result {
+        reader.abort();
+        return Err(e);
     }
 
-    tx.send(Message::text(
-        json!({"type":"end","group":group,"from":self_id}).to_string(),
-    ))
-    .await
-    .map_err(|e| format!("send end: {e}"))?;
+    tx.send(Message::text(with(frame_base.clone(), json!({"type":"end"})).to_string()))
+        .await
+        .map_err(|e| format!("send end: {e}"))?;
 
     // wait for a receiver to confirm (or report a decrypt failure)
-    match await_type(&mut rx, &["complete"], 600).await {
-        Ok(_) => Ok(total),
-        Err(e) if e.starts_with("timed out") => Err("no device in the group confirmed receipt within 10 minutes".into()),
-        Err(e) => Err(e),
-    }
+    let outcome = match tokio::time::timeout(std::time::Duration::from_secs(600), ack_rx.recv()).await {
+        Ok(Some(r)) => r,
+        Ok(None) => Err("relay closed the connection".into()),
+        Err(_) => Err("no device confirmed receipt within 10 minutes".into()),
+    };
+    reader.abort();
+    outcome.map(|_| total)
 }
 
-/// Persistent receive loop — abort + respawn when the tunnel config changes.
 /// one-shot probe: register with a group and list its members
 pub async fn devices(relay: &str, group: &str, self_id: &str) -> Result<Vec<String>, String> {
     let (ws, _) = connect(relay).await?;
@@ -407,6 +481,7 @@ pub async fn receive_loop(relay: String, group: String, self_id: String, app: Ap
                 match await_registered(&mut rx).await {
                     Ok(v) => {
                         let role = v["role"].as_str().unwrap_or("member").to_string();
+                        update_members(&v["members"]);
                         set_status(format!("online ({role})"));
                         use tauri::Emitter;
                         let _ = app.emit("tunnel-status", json!({"status": status(), "role": role, "members": v["members"]}));
@@ -429,11 +504,11 @@ pub async fn receive_loop(relay: String, group: String, self_id: String, app: Ap
                 loop {
                     tokio::select! {
                         _ = refresh.tick() => {
-                            if last_seen.elapsed() > std::time::Duration::from_secs(30) {
+                            if last_seen.elapsed() > std::time::Duration::from_secs(75) {
                                 println!("[tunnel] connection stale — reconnecting");
                                 break;
                             }
-                            if tx.send(Message::text(json!({"type":"devices"}).to_string())).await.is_err() {
+                            if tx.send(Message::text(json!({"type":"members"}).to_string())).await.is_err() {
                                 break;
                             }
                         }
@@ -564,7 +639,8 @@ async fn handle_frame(
             use tauri::Emitter;
             let _ = app.emit("tunnel-join-decided", v.clone());
         }
-        "registered" | "ok" | "members" | "pending" => {}
+        "members" => update_members(&v["members"]),
+        "registered" | "ok" | "pending" => {}
         "error" => {
             let e = v["err"].as_str().unwrap_or("relay error");
             println!("[tunnel] relay: {e}");

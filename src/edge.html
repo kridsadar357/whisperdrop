@@ -354,8 +354,18 @@
           () => { if (pendingFiles.length) startTransfer(p); }));
       }
       if (GROUP) {
-        peerListEl.appendChild(row(avatar('🌐', 'grp'), `Group ${GROUP}`,
-          'every device in the group · encrypted tunnel', 'TUNNEL',
+        // each online member of the group, then the whole group
+        let members = [];
+        try { members = await invoke('get_tunnel_members'); } catch (e) { dbg('members ' + e); }
+        if (mode !== 'panel') return;
+        for (const m of members.filter(m => m.online)) {
+          peerListEl.appendChild(row(avatar(m.name || m.device_id), m.name || m.device_id,
+            `${m.device_id}${m.role === 'head' ? ' · head' : ''} · encrypted tunnel`, 'TUNNEL',
+            () => { if (pendingFiles.length) startTransfer({ name: m.name || m.device_id, tunnel: true, target: m.device_id }); }));
+        }
+        const offline = members.filter(m => !m.online).length;
+        peerListEl.appendChild(row(avatar('🌐', 'grp'), `Everyone in group ${GROUP}`,
+          `${members.filter(m => m.online).length} online${offline ? ` · ${offline} offline` : ''} · encrypted tunnel`, 'GROUP',
           () => { if (pendingFiles.length) startTransfer({ name: `Group ${GROUP}`, tunnel: true, target: GROUP }); }));
       }
       if (!peerListEl.children.length) {
@@ -447,7 +457,7 @@
       progressListEl.innerHTML = '';
       xfers.clear();
       panelTitle.textContent = `Sending to ${peer.name}`;
-      panelSubtitle.textContent = peer.tunnel ? 'encrypted tunnel' : peer.ip;
+      panelSubtitle.textContent = peer.tunnel ? (peer.target === GROUP ? 'everyone · encrypted tunnel' : 'encrypted tunnel') : peer.ip;
 
       const queue = [];
       for (const fp of pendingFiles) {

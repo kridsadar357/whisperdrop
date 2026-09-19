@@ -1,6 +1,6 @@
 [package]
 name = "whisperdrop-relay"
-version = "0.4.1"
+version = "0.4.2"
 description = "WebSocket relay for WhisperDrop cross-network transfers"
 edition = "2021"
 

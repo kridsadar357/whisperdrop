@@ -145,6 +145,9 @@ mod imp {
     #[derive(Clone)]
     enum Row {
         Lan { name: String, ip: String, port: u16 },
+        /// one online member of our group
+        TunnelDevice { device_id: String, name: String, head: bool },
+        /// everyone in the group
         Tunnel { group: String },
         Retry,
     }
@@ -544,6 +547,9 @@ mod imp {
             .collect();
         let group = crate::tunnel::current_group();
         if crate::relay_url().is_some() && !group.is_empty() {
+            for m in crate::tunnel::members().into_iter().filter(|m| m.online) {
+                rows.push(Row::TunnelDevice { device_id: m.device_id, name: m.name, head: m.role == "head" });
+            }
             rows.push(Row::Tunnel { group });
         }
         if rows.is_empty() {
@@ -753,7 +759,8 @@ mod imp {
             }
             let (title, subtitle, indeterminate) = match &row {
                 Row::Lan { name, ip, .. } => (format!("Sending to {name}"), ip.clone(), false),
-                Row::Tunnel { group } => (format!("Sending to group {group}"), "encrypted tunnel".into(), true),
+                Row::TunnelDevice { name, .. } => (format!("Sending to {name}"), "encrypted tunnel".into(), true),
+                Row::Tunnel { group } => (format!("Sending to group {group}"), "everyone · encrypted tunnel".into(), true),
                 Row::Retry => return,
             };
             p.title = title;
@@ -776,6 +783,7 @@ mod imp {
         };
         let destination = match &row {
             Row::Lan { ip, port, .. } => format!("{ip}:{port}"),
+            Row::TunnelDevice { name, device_id, .. } => format!("{name} ({device_id}) via tunnel"),
             Row::Tunnel { group } => format!("group {group} via tunnel"),
             Row::Retry => String::new(),
         };
@@ -794,8 +802,12 @@ mod imp {
                     Row::Lan { ip, port, .. } => {
                         crate::sender::send_file_with_progress(ip, *port, path, sent, Some(total)).await
                     }
+                    Row::TunnelDevice { device_id, .. } => match crate::relay_url() {
+                        Some(relay) => crate::tunnel::send_over_tunnel(&relay, &crate::tunnel::current_group(), path, Some(device_id)).await,
+                        None => Err("tunnel not configured".into()),
+                    },
                     Row::Tunnel { group } => match crate::relay_url() {
-                        Some(relay) => crate::tunnel::send_over_tunnel(&relay, group, path).await,
+                        Some(relay) => crate::tunnel::send_over_tunnel(&relay, group, path, None).await,
                         None => Err("tunnel not configured".into()),
                     },
                     Row::Retry => Err(String::new()),
@@ -894,7 +906,8 @@ mod imp {
                     c.rrect_stroke(list_x as f64, y as f64, list_w as f64, ROW_H * sc, 14.0 * sc, stroke, 1.0);
                     let (name, meta, tag, av_text, av_col): (String, String, &str, String, (u8, u8, u8)) = match row {
                         Row::Lan { name, ip, port } => (name.clone(), format!("{ip}:{port}"), "LAN", glass::monogram(name), glass::hue_for(name)),
-                        Row::Tunnel { group } => (format!("Group {group}"), "every device in the group · encrypted tunnel".into(), "TUNNEL", String::new(), (139, 92, 246)),
+                        Row::TunnelDevice { device_id, name, head } => (name.clone(), format!("{device_id}{} · encrypted tunnel", if *head { " · head" } else { "" }), "TUNNEL", glass::monogram(name), glass::hue_for(name)),
+                        Row::Tunnel { group } => (format!("Everyone in group {group}"), "every online device in the group · encrypted tunnel".into(), "GROUP", String::new(), (139, 92, 246)),
                         Row::Retry => ("No devices yet".into(), "open WhisperDrop on the other machine, then tap to retry".into(), "", String::new(), (100, 104, 120)),
                     };
                     // avatar

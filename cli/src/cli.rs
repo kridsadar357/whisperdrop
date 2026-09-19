@@ -210,7 +210,7 @@ pub async fn run(cmd: Command) -> Result<(), String> {
                 println!("→ group {group} via {relay}");
                 for f in &files {
                     let path = f.display().to_string();
-                    match crate::tunnel::send_over_tunnel(&relay, &group, &path).await {
+                    match crate::tunnel::send_over_tunnel(&relay, &group, &path, None).await {
                         Ok(n) => println!("✓ {} — {} sent, confirmed by the receiver", f.display(), fmt_bytes(n)),
                         Err(e) => return Err(format!("{}: {e}", f.display())),
                     }
@@ -218,7 +218,37 @@ pub async fn run(cmd: Command) -> Result<(), String> {
                 return Ok(());
             }
 
-            let peer = resolve_target(to.as_deref(), wait).await?;
+            let peer = match resolve_target(to.as_deref(), wait).await {
+                Ok(p) => p,
+                Err(lan_err) => {
+                    // not on the LAN — maybe a member of our tunnel group
+                    if let (Some(t), false) = (to.as_deref(), cfg.tunnel.member_token.is_empty()) {
+                        let wanted = t.to_lowercase();
+                        crate::tunnel::set_group(cfg.group_id.clone());
+                        let v = crate::tunnel::group_query(&relay, &cfg.group_id, serde_json::json!({"type":"members"}), &["members"]).await?;
+                        let hit = v["members"].as_array().cloned().unwrap_or_default().into_iter().find(|m| {
+                            m["device_id"].as_str().map(|s| s.to_lowercase() == wanted).unwrap_or(false)
+                                || m["name"].as_str().map(|s| s.to_lowercase() == wanted).unwrap_or(false)
+                        });
+                        if let Some(m) = hit {
+                            let (dev, name) = (m["device_id"].as_str().unwrap_or("").to_string(), m["name"].as_str().unwrap_or("").to_string());
+                            if !m["online"].as_bool().unwrap_or(false) {
+                                return Err(format!("{name} ({dev}) is in your group but offline"));
+                            }
+                            println!("→ {name} ({dev}) via encrypted tunnel");
+                            for f in &files {
+                                let path = f.display().to_string();
+                                match crate::tunnel::send_over_tunnel(&relay, &cfg.group_id, &path, Some(&dev)).await {
+                                    Ok(n) => println!("✓ {} — {} sent, confirmed by {name}", f.display(), fmt_bytes(n)),
+                                    Err(e) => return Err(format!("{}: {e}", f.display())),
+                                }
+                            }
+                            return Ok(());
+                        }
+                    }
+                    return Err(lan_err);
+                }
+            };
             println!("→ {} ({}:{})", peer.name, peer.ip, peer.port);
             for f in &files {
                 let path = f.display().to_string();

@@ -443,6 +443,12 @@ async fn group_leave(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Members of our group (from the receive loop's cache).
+#[tauri::command]
+fn get_tunnel_members() -> Vec<tunnel::Member> {
+    tunnel::TUNNEL_MEMBERS.lock().unwrap().clone()
+}
+
 #[tauri::command]
 fn tunnel_status() -> serde_json::Value {
     let cfg = get_cfg();
@@ -504,12 +510,15 @@ async fn send_file_tunnel(
         }
     });
 
+    // `target` is the group id (broadcast) or one member's device id
+    let to = if target.trim().is_empty() || target == cfg.group_id { None } else { Some(target.as_str()) };
     let result = tunnel::send_over_tunnel(
         &cfg.tunnel.relay,
         &cfg.group_id,
-        "mac",
+        &cfg.tunnel.device_id,
         &file_path,
         sent,
+        to,
     )
     .await;
     watcher.abort();
@@ -729,6 +738,7 @@ pub fn run() {
             group_kick,
             group_leave,
             tunnel_status,
+            get_tunnel_members,
             get_online_peers,
             get_config,
             get_tunnel_peers,
