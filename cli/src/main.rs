@@ -322,9 +322,13 @@ async fn upload(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let dest = unique_path(&dir, &filename);
 
-    let mut file = tokio::fs::File::create(&dest)
+    let file = tokio::fs::File::create(&dest)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // 1 MiB buffer: without it each small network chunk is a separate
+    // blocking-pool write (and on Windows a fresh touch for Defender to
+    // scan), which throttles LAN throughput to a crawl.
+    let mut file = tokio::io::BufWriter::with_capacity(1 << 20, file);
     // Expected size comes from the sender's Content-Length (streamed
     // uploads); without it the overlay shows an indeterminate bar.
     let total = headers

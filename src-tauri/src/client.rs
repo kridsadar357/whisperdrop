@@ -120,6 +120,7 @@ async fn send_file_inner(
     let client = reqwest::Client::builder()
         // Firewall-silent-drops otherwise leave the widget at 0% forever.
         .connect_timeout(std::time::Duration::from_secs(6))
+        .tcp_nodelay(true)
         .build()
         .map_err(|e| format!("client init: {e}"))?;
     let resp = client

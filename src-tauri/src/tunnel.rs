@@ -93,7 +93,7 @@ static IN_NAME: Mutex<String> = Mutex::new(String::new());
 static IN_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 /// Open handle for the .part file (kept across chunks — reopening per
 /// chunk is slow, especially on Windows with real-time AV scanning).
-static IN_HANDLE: tokio::sync::Mutex<Option<tokio::fs::File>> = tokio::sync::Mutex::const_new(None);
+static IN_HANDLE: tokio::sync::Mutex<Option<tokio::io::BufWriter<tokio::fs::File>>> = tokio::sync::Mutex::const_new(None);
 
 async fn part_write(bytes: &[u8]) {
     use tokio::io::AsyncWriteExt;
@@ -101,7 +101,10 @@ async fn part_write(bytes: &[u8]) {
     if h.is_none() {
         let path = IN_FILE.lock().unwrap().clone();
         if let Some(p) = path {
-            *h = tokio::fs::OpenOptions::new().append(true).open(&p).await.ok();
+            // 1 MiB buffer — one blocking-pool write (and AV touch) per MiB
+            // instead of per chunk keeps Windows tunnel writes off the floor
+            *h = tokio::fs::OpenOptions::new().append(true).open(&p).await.ok()
+                .map(|f| tokio::io::BufWriter::with_capacity(1 << 20, f));
         }
     }
     if let Some(f) = h.as_mut() {

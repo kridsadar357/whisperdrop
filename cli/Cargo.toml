@@ -1,6 +1,6 @@
 [package]
 name = "whisperdrop"
-version = "0.4.2"
+version = "0.4.3"
 description = "WhisperDrop — send and receive files over LAN or the encrypted tunnel, from the edge drop zone or the command line"
 edition = "2021"
 
