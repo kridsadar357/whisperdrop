@@ -18,7 +18,7 @@ jobs:
       matrix:
         include:
           - { os: macos-14,      target: aarch64-apple-darwin,      ext: "" }
-          - { os: macos-13,      target: x86_64-apple-darwin,       ext: "" }
+          - { os: macos-14,      target: x86_64-apple-darwin,       ext: "" }   # cross-compiled on arm64 (Intel runners are retired)
           - { os: ubuntu-22.04,  target: x86_64-unknown-linux-gnu,  ext: "" }
           - { os: windows-latest, target: x86_64-pc-windows-msvc,   ext: ".exe" }
     runs-on: ${{ matrix.os }}
