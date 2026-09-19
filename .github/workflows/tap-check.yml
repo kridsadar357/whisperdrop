@@ -1,0 +1,20 @@
+name: tap-check
+
+# Installs the published formula from the Homebrew tap on a clean macOS
+# runner — proves `brew install` works for end users.
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["release"]
+    types: [completed]
+
+jobs:
+  brew:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: macos-14
+    steps:
+      - run: brew tap ${{ github.repository_owner }}/whisperdrop
+      - run: brew trust ${{ github.repository_owner }}/whisperdrop || true
+      - run: brew install whisperdrop
+      - run: whisperdrop --version && whisperdrop --help
+      - run: brew test whisperdrop
