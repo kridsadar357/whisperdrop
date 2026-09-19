@@ -1,0 +1,12 @@
+{
+  "version": "0.2.3",
+  "notes": "Pairing passphrases add end-to-end encryption for tunnel transfers.",
+  "macos": {
+    "url": "REPLACE_WITH_SIGNED_DMG_URL",
+    "sha256": "REPLACE_AFTER_BUILD"
+  },
+  "windows": {
+    "url": "REPLACE_WITH_SIGNED_SETUP_URL",
+    "sha256": "REPLACE_AFTER_BUILD"
+  }
+}

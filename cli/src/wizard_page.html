@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<title>WhisperDrop Setup</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    min-height: 100vh; color: #f2f4fa;
+    background: linear-gradient(160deg, #10141f 0%, #0a0d16 60%, #131a2b 100%);
+    font-family: -apple-system, "Segoe UI", sans-serif;
+    display: flex; justify-content: center; padding: 40px 16px;
+  }
+  .card {
+    width: 100%; max-width: 620px; border-radius: 22px;
+    border: 1px solid rgba(255,255,255,.10);
+    background: linear-gradient(180deg, rgba(44,50,76,.75), rgba(14,16,28,.82));
+    box-shadow: 0 18px 50px rgba(0,0,0,.45);
+    padding: 28px 30px; height: fit-content;
+  }
+  h1 { font-size: 22px; font-weight: 800; text-align: center; }
+  .sub { text-align: center; font-size: 12px; color: rgba(255,255,255,.45); margin: 4px 0 20px; }
+  section { border-top: 1px solid rgba(255,255,255,.08); padding: 18px 0; }
+  section h2 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  section .desc { font-size: 12px; color: rgba(255,255,255,.5); margin-bottom: 12px; }
+  .result { font-size: 13px; margin-top: 10px; line-height: 1.7; }
+  .ok { color: #30d158; } .bad { color: #ff6961; } .dim { color: rgba(255,255,255,.45); }
+  input[type=text] {
+    width: 100%; border-radius: 10px; border: 1px solid rgba(255,255,255,.18);
+    background: rgba(255,255,255,.08); color: #fff; padding: 10px 12px;
+    font-size: 13px; outline: none;
+  }
+  input[type=text]:focus { border-color: #0a84ff; }
+  label.sw { display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer; }
+  .sw input { appearance: none; width: 42px; height: 24px; border-radius: 12px;
+    background: rgba(255,255,255,.18); position: relative; cursor: pointer; transition: .2s; }
+  .sw input:checked { background: #30d158; }
+  .sw input::after { content: ""; position: absolute; width: 20px; height: 20px;
+    border-radius: 50%; background: #fff; top: 2px; left: 2px; transition: .2s; }
+  .sw input:checked::after { left: 20px; }
+  .poscards { display: flex; gap: 14px; }
+  .poscard { flex: 1; border-radius: 16px; cursor: pointer; text-align: center;
+    padding: 18px 0 14px; border: 1.5px solid rgba(255,255,255,.12);
+    background: rgba(255,255,255,.05); transition: .15s; }
+  .poscard.sel { border-color: #0a84ff; background: rgba(10,132,255,.16); }
+  .poscard .mini { width: 46px; height: 74px; border-radius: 9px; margin: 0 auto 10px;
+    background: linear-gradient(180deg,#0a84ff,#0060df); }
+  .poscard[data-pos="left"] .mini { margin-right: auto; }
+  .poscard[data-pos="right"] .mini { margin-left: auto; }
+  .poscard .t { font-size: 13px; font-weight: 700; }
+  button {
+    border: none; border-radius: 12px; cursor: pointer; padding: 10px 20px;
+    font-size: 13px; font-weight: 700; color: #fff;
+    background: linear-gradient(135deg,#0a84ff,#5e5ce6);
+  }
+  button:hover { filter: brightness(1.15); }
+  button.ghost { background: rgba(255,255,255,.10); }
+  .done { text-align: center; padding: 30px 0; }
+  .done .big { font-size: 42px; }
+  pre { white-space: pre-wrap; max-height: 180px; overflow: auto; padding: 10px; border-radius: 10px; background: rgba(0,0,0,.22); color: #b9c2d6; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>WhisperDrop Setup</h1>
+  <div class="sub">Send &amp; receive between your devices</div>
+
+  <section>
+    <h2>1 · Local network</h2>
+    <div class="desc">Automatic check of your LAN connection and receive port.</div>
+    <div class="result" id="r1">checking…</div>
+  </section>
+
+  <section>
+    <h2>2 · Tunnel <span class="dim">(cross-network)</span></h2>
+    <div class="desc">Send across networks via riki-api.online — each device gets its own identity.</div>
+    <label class="sw"><input type="checkbox" id="tunEn" /> Enable tunnel</label>
+    <div style="margin-top:12px">
+      <input type="text" id="relay" />
+      <div class="dim" style="font-size:11px;margin-top:4px">relay endpoint (wss://)</div>
+    </div>
+    <div style="margin-top:12px" class="dim">This device's identity:
+      <b id="devid" style="color:#64d2ff;font-family:ui-monospace"></b></div>
+    <div style="margin-top:12px">
+      <input type="password" id="pairSecret" placeholder="Pairing passphrase (same on trusted devices)" autocomplete="off" />
+      <div class="dim" style="font-size:11px;margin-top:4px">Optional but recommended: encrypts tunnel file contents end-to-end. It is never sent to the relay.</div>
+    </div>
+    <div style="margin-top:12px">
+      <input type="text" id="tunnelPeers" placeholder="Trusted tunnel device IDs, comma-separated" />
+      <div class="dim" style="font-size:11px;margin-top:4px">Fallback when relay discovery is unavailable. Read each ID from the other device's Preferences.</div>
+    </div>
+    <div style="margin-top:12px"><button class="ghost" id="testBtn">Test connection</button></div>
+    <div class="result" id="r2"></div>
+  </section>
+
+  <section>
+    <h2>3 · Drop zone position</h2>
+    <div class="desc">Where the amber strip lives — applied instantly.</div>
+    <div class="poscards">
+      <div class="poscard" data-pos="left" onclick="pickSide('left')">
+        <div class="mini"></div><div class="t">Left edge</div>
+      </div>
+      <div class="poscard sel" data-pos="right" onclick="pickSide('right')">
+        <div class="mini"></div><div class="t">Right edge</div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>3.5 · Pair with another device</h2>
+    <div class="desc">Show this QR on the other device's wizard — or paste their code here.</div>
+    <div id="qrBox" style="text-align:center;margin:10px 0;min-height:10px"></div>
+    <div style="display:flex;gap:10px;margin:8px 0">
+      <button class="ghost" id="qrBtn">Show my pairing QR</button>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:8px">
+      <input type="text" id="pairInput" placeholder="wd1|wss://…|secret" style="flex:1" />
+      <button id="pairApply" class="ghost">Apply</button>
+    </div>
+    <div class="result" id="pairResult"></div>
+  </section>
+
+  <section>
+    <h2>4 · Firewall</h2>
+    <input type="text" id="receiveDir" placeholder="Receive folder" />
+    <div class="result"><span class="ok">✓</span> Handled automatically — the app opens its
+      own inbound rule (one UAC prompt on first run).</div>
+  </section>
+
+  <section>
+    <h2>6 · Summary</h2>
+    <div class="result" id="sum"></div>
+    <div style="margin-top:14px"><button id="saveBtn">Save &amp; Apply</button></div>
+    <div class="result" id="r5"></div>
+  </section>
+
+  <section>
+    <h2>Devices &amp; activity</h2>
+    <div class="desc">Refresh discovery before dropping a file on the edge strip. Select its destination from the native device menu.</div>
+    <button class="ghost" id="refreshBtn">↻ Refresh / Rescan devices</button>
+    <button class="ghost" id="logBtn" style="margin-left:6px">View log</button>
+    <div class="result" id="devices"></div>
+    <pre id="log" hidden></pre>
+  </section>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let position = 'right';
+  let tunnelEnabled = false;
+
+  async function loadState() {
+    const st = await (await fetch('/api/wizard/state')).json();
+    $('relay').value = st.tunnel.relay;
+    $('devid').textContent = st.tunnel.device_id;
+    $('tunEn').checked = st.tunnel.enabled;
+    $('receiveDir').value = st.receive_dir || '';
+    $('pairSecret').value = st.tunnel.shared_secret || '';
+    $('tunnelPeers').value = (st.known_tunnel_devices || []).join(', ');
+    tunnelEnabled = st.tunnel.enabled;
+    position = st.position;
+    document.querySelectorAll('.poscard').forEach(c =>
+      c.classList.toggle('sel', c.dataset.pos === st.position));
+    $('r1').innerHTML = st.net.port_ok
+      ? `<span class="ok">✓</span> Connected — LAN IP: <b>${st.net.ip}</b><br><span class="ok">✓</span> receive port free and ready`
+      : `<span class="bad">✗</span> LAN IP: ${st.net.ip} — ports busy (will use next available)`;
+    summary();
+  }
+
+  function pickSide(p) {
+    position = p;
+    document.querySelectorAll('.poscard').forEach(c =>
+      c.classList.toggle('sel', c.dataset.pos === p));
+  }
+
+  $('tunEn').onchange = (e) => { tunnelEnabled = e.target.checked; summary(); };
+  $('relay').oninput = (e) => { summary(); };
+
+  $('testBtn').onclick = async () => {
+    $('r2').innerHTML = '<span class="dim">connecting…</span>';
+    try {
+      const res = await fetch('/api/wizard/test-tunnel', {
+        method: 'POST',
+        body: JSON.stringify({ relay: $('relay').value.trim(), device_id: $('devid').textContent })
+      });
+      const j = await res.json();
+      if (j.ok) {
+        $('r2').innerHTML = `<span class="ok">✓ relay connected</span> — device list will refresh after setup`;
+      } else {
+        $('r2').innerHTML = `<span class="bad">✗ ${j.err}</span><br><span class="dim">LAN transfers still work without the tunnel.</span>`;
+      }
+    } catch (e) { $('r2').innerHTML = `<span class="bad">✗ ${e}</span>`; }
+    summary();
+  };
+
+  function summary() {
+    const tun = $('tunEn').checked;
+    $('sum').innerHTML =
+      `• Position: <b>${position}</b> edge<br>` +
+      `• Tunnel: <b>${tun ? 'enabled — ' + $('relay').value : 'disabled (LAN only)'}</b><br>` +
+      `• Encryption: <b>${tun ? ($('pairSecret').value.trim() ? 'end-to-end encrypted' : 'pairing passphrase required') : 'not applicable'}</b><br>` +
+      `• Identity: <b>${$('devid').textContent}</b>`;
+  }
+
+  $('saveBtn').onclick = async () => {
+    if ($('tunEn').checked && !$('pairSecret').value.trim()) {
+      $('r5').innerHTML = '<span class="bad">Enter the same pairing passphrase on every trusted tunnel device.</span>';
+      return;
+    }
+    tunnelEnabled = $('tunEn').checked;
+    const res = await fetch('/api/wizard/finish', {
+      method: 'POST',
+      body: JSON.stringify({
+        position, tunnel_enabled: tunnelEnabled,
+        relay: $('relay').value.trim(), device_id: $('devid').textContent,
+        receive_dir: $('receiveDir').value.trim(), shared_secret: $('pairSecret').value,
+        tunnel_peers: $('tunnelPeers').value.trim()
+      })
+    });
+    const j = await res.json();
+    if (j.ok) {
+      document.querySelector('.card').innerHTML =
+        `<div class="done"><div class="big">✅</div><h1>Congratulations — setup complete!</h1>` +
+        `<div class="sub">WhisperDrop is running in the notification area. This page will close now.</div></div>`;
+      setTimeout(() => window.close(), 1800);
+    } else {
+      $('r5').innerHTML = `<span class="bad">save failed: ${j.err || '?'}</span>`;
+    }
+  };
+
+  $('refreshBtn').onclick = async () => {
+    $('devices').innerHTML = '<span class="dim">scanning LAN and tunnel…</span>';
+    const d = await (await fetch('/api/devices/refresh')).json();
+    const lan = d.lan.map(x => `• ${x.name} <span class="dim">${x.address}</span>`);
+    const tun = d.tunnel.map(x => `• 🌐 ${x} <span class="dim">tunnel</span>`);
+    $('devices').innerHTML = (lan.concat(tun).join('<br>') || '<span class="dim">No devices online yet.</span>');
+  };
+  $('logBtn').onclick = async () => {
+    const el = $('log'); el.hidden = !el.hidden;
+    if (!el.hidden) el.textContent = await (await fetch('/api/activity')).text();
+  };
+
+  const qrBtn = document.getElementById('qrBtn');
+  const pairApply = document.getElementById('pairApply');
+  const pairInput = document.getElementById('pairInput');
+  const pairResult = document.getElementById('pairResult');
+  qrBtn.onclick = async () => {
+    const svg = await (await fetch('/api/pairing/qr')).text();
+    qrBox0 = document.getElementById('qrBox');
+    qrBox0.innerHTML = svg;
+  };
+  pairApply.onclick = async () => {
+    const code = pairInput.value.trim();
+    const res = await fetch('/api/pairing/apply', { method: 'POST', body: code });
+    const j = await res.json();
+    pairResult.innerHTML = j.ok
+      ? '<span class="ok">✓ pairing applied</span>'
+      : `<span class="bad">✗ ${j.err}</span>`;
+  };
+  loadState();
+</script>
+</body>
+</html>

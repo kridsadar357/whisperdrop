@@ -1,0 +1,34 @@
+[package]
+name = "whisperdrop"
+version = "0.3.0"
+description = "WhisperDrop — send and receive files over LAN or the encrypted tunnel, from the edge drop zone or the command line"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["http1", "tokio", "multipart"] }
+futures-util = "0.3"
+mdns-sd = "0.11"
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["stream", "blocking"] }
+tokio-util = { version = "0.7", features = ["io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+sha2 = "0.10"
+chacha20poly1305 = "0.10"
+qrcodegen = "1.8"
+windows-sys = { version = "0.48", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-item = "0.10"
+
+[build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1

@@ -1,0 +1,4 @@
+# Development-build checksums only. Signing/notarization changes the files,
+# so generate production checksums again after those steps.
+ba4687a731b62a7bd91e4974a62cca87243757736f2d5f5918357c3637d3c188  WhisperDrop_0.2.0_aarch64.dmg
+f0df4ea95a49c47ecb8dda4baa37af9446a50bd6da86bcdac46fcff7a5142ba1  WhisperDropReceiver.exe

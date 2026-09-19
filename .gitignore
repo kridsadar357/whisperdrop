@@ -1,0 +1,12 @@
+# build output
+target/
+node_modules/
+dist/*.exe
+src-tauri/gen/schemas/
+*.dmg
+*.app
+
+# local state / secrets
+.DS_Store
+.env
+*.local

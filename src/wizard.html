@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    background: linear-gradient(160deg, #10141f 0%, #0a0d16 60%, #131a2b 100%);
+    color: #f2f4fa;
+    font-family: -apple-system, "SF Pro", "Segoe UI", sans-serif;
+    overflow: hidden; user-select: none;
+  }
+  .wrap { display: flex; flex-direction: column; height: 100%; padding: 26px 30px 20px; }
+  h1 { font-size: 21px; font-weight: 800; letter-spacing: .2px; text-align: center; }
+  .sub { text-align: center; font-size: 12px; color: rgba(255,255,255,.45); margin-top: 4px; }
+
+  .dots { display: flex; justify-content: center; gap: 8px; margin: 16px 0 6px; }
+  .dot { width: 34px; height: 5px; border-radius: 3px; background: rgba(255,255,255,.14); transition: .3s; }
+  .dot.on { background: linear-gradient(90deg,#0a84ff,#64d2ff); }
+
+  .stepbox {
+    flex: 1; border-radius: 18px; border: 1px solid rgba(255,255,255,.10);
+    background: rgba(255,255,255,.045);
+    padding: 20px 22px; overflow-y: auto; display: none;
+  }
+  .stepbox.show { display: block; }
+  .stepbox h2 { font-size: 15px; font-weight: 700; margin-bottom: 4px; }
+  .stepbox .desc { font-size: 12px; color: rgba(255,255,255,.5); margin-bottom: 14px; }
+
+  .result { font-size: 13px; margin-top: 12px; line-height: 1.7; }
+  .ok { color: #30d158; } .bad { color: #ff6961; } .dim { color: rgba(255,255,255,.45); }
+
+  .btn {
+    border: none; border-radius: 12px; cursor: pointer;
+    padding: 11px 22px; font-size: 13px; font-weight: 700; color: #fff;
+    background: linear-gradient(135deg,#0a84ff,#5e5ce6);
+  }
+  .btn:hover { filter: brightness(1.15); }
+  .btn.ghost { background: rgba(255,255,255,.10); }
+  .row { display: flex; gap: 10px; margin-top: 16px; justify-content: flex-end; }
+
+  .poscards { display: flex; gap: 14px; }
+  .poscard {
+    flex: 1; border-radius: 16px; cursor: pointer; text-align: center;
+    padding: 22px 0 18px; border: 1.5px solid rgba(255,255,255,.12);
+    background: rgba(255,255,255,.05); transition: .15s;
+  }
+  .poscard.sel { border-color: #0a84ff; background: rgba(10,132,255,.16); }
+  .poscard .mini { width: 46px; height: 74px; border-radius: 9px; margin: 0 auto 10px;
+    background: linear-gradient(180deg,#0a84ff,#0060df); position: relative; }
+  .poscard[data-side="left"] .mini { margin-left: 6px; }
+  .poscard[data-side="right"] .mini { margin-right: 6px; }
+  .poscard .t { font-size: 13px; font-weight: 700; }
+
+  input[type=text] {
+    width: 100%; border-radius: 10px; border: 1px solid rgba(255,255,255,.18);
+    background: rgba(255,255,255,.08); color: #fff; padding: 10px 12px;
+    font-size: 13px; outline: none;
+  }
+  input[type=text]:focus { border-color: #0a84ff; }
+  label.sw { display: flex; align-items: center; gap: 10px; font-size: 13px; cursor: pointer; }
+  .sw input { appearance: none; width: 42px; height: 24px; border-radius: 12px;
+    background: rgba(255,255,255,.18); position: relative; cursor: pointer; transition: .2s; }
+  .sw input:checked { background: #30d158; }
+  .sw input::after { content: ""; position: absolute; width: 20px; height: 20px;
+    border-radius: 50%; background: #fff; top: 2px; left: 2px; transition: .2s; }
+  .sw input:checked::after { left: 20px; }
+
+  .sum { font-size: 13px; line-height: 2.1; }
+  .nav { display: flex; justify-content: space-between; padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WhisperDrop Setup</h1>
+  <div class="sub">Get your device ready to send & receive</div>
+  <div class="dots">
+    <div class="dot" data-s="1"></div><div class="dot" data-s="2"></div>
+    <div class="dot" data-s="3"></div><div class="dot" data-s="4"></div>
+    <div class="dot" data-s="5"></div>
+  </div>
+
+  <div class="stepbox show" id="s1">
+    <h2>1 · Local network</h2>
+    <div class="desc">We check your LAN connection and make sure a receive port is free.</div>
+    <div class="result" id="r1">checking…</div>
+    <div class="row"><button class="btn" onclick="go(2)">Continue</button></div>
+  </div>
+
+  <div class="stepbox" id="s2">
+    <h2>2 · Tunnel</h2>
+    <div class="desc">Send across networks through riki-api.online — each device gets its own identity.</div>
+    <label class="sw"><input type="checkbox" id="tunEn" /> Enable tunnel</label>
+    <div style="margin-top:12px">
+      <input type="text" id="relay" />
+      <div class="dim" style="font-size:11px;margin-top:4px">relay endpoint (wss://)</div>
+    </div>
+    <div style="margin-top:12px" class="dim">This device's identity:
+      <b id="devid" style="color:#64d2ff;font-family:ui-monospace"></b></div>
+    <div style="margin-top:12px">
+      <div style="font-size:13px;font-weight:700;margin-bottom:6px">Group ID (6 digits)</div>
+      <input type="text" id="groupId" maxlength="6" inputmode="numeric"
+        placeholder="เช่น 482913 — ตัวเลขเดียวกันทุกเครื่องที่ต้องการส่งหากัน" />
+      <div class="dim" style="font-size:11px;margin-top:4px">
+        ทุกเครื่องที่ใช้ Group ID เดียวกัน (และ passphrase เดียวกัน) จะเห็นและส่งไฟล์ถึงกันได้
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <input type="password" id="pairSecret" placeholder="Pairing passphrase (same on trusted devices)" autocomplete="off" />
+      <div class="dim" style="font-size:11px;margin-top:4px">Optional but recommended: encrypts tunnel file contents end-to-end. The relay never receives this passphrase.</div>
+    </div>
+    <div style="margin-top:12px">
+      <input type="text" id="tunnelPeers" placeholder="Trusted tunnel device IDs, comma-separated" />
+      <div class="dim" style="font-size:11px;margin-top:4px">Fallback when relay discovery is unavailable. Read each ID from the other device's Setup/Preferences.</div>
+    </div>
+    <div class="row"><button class="btn ghost" onclick="go(1)">Back</button>
+      <button class="btn" id="tunTest" onclick="testTunnel()">Test & Continue</button></div>
+    <div class="result" id="r2"></div>
+  </div>
+
+  <div class="stepbox" id="s3">
+    <h2>3 · Drop zone position</h2>
+    <div class="desc">Where the edge drop zone lives — the transfer overlay uses the same side.</div>
+    <div class="poscards">
+      <div class="poscard" data-side="left" onclick="pickSide('left')">
+        <div class="mini"></div><div class="t">Left edge</div>
+      </div>
+      <div class="poscard sel" data-side="right" onclick="pickSide('right')">
+        <div class="mini"></div><div class="t">Right edge</div>
+      </div>
+    </div>
+    <div class="row"><button class="btn ghost" onclick="go(2)">Back</button>
+      <button class="btn" onclick="go(4)">Continue</button></div>
+  </div>
+
+  <div class="stepbox" id="s4">
+    <h2>4 · Firewall</h2>
+    <div class="desc">WhisperDrop needs to accept incoming connections.</div>
+    <input id="receiveDir" type="text" placeholder="Receive folder" />
+    <div class="result"><span class="ok">✓</span> Not required on macOS — the app receives
+      without extra firewall configuration.</div>
+    <div class="row"><button class="btn ghost" onclick="go(3)">Back</button>
+      <button class="btn" onclick="go(5)">Continue</button></div>
+  </div>
+
+  <div class="stepbox" id="s5">
+    <h2>5 · Summary</h2>
+    <div class="desc">Everything ready?</div>
+    <div class="sum" id="sum"></div>
+    <div class="result" id="r5"></div>
+    <div class="row"><button class="btn ghost" onclick="go(1)">Start over</button>
+      <button class="btn" id="finishBtn" onclick="finish()">Finish & Save</button></div>
+  </div>
+
+  <div class="nav">
+    <button class="btn ghost" id="backBtn" onclick="back()" style="visibility:hidden">Back</button>
+    <button class="btn" id="nextBtn" onclick="next()">Next</button>
+  </div>
+</div>
+
+<script type="module">
+  const { invoke } = window.__TAURI__.core;
+  const dbg = (m) => invoke('ui_debug', { msg: m }).catch(() => {});
+
+  let cur = 1;
+  const state = {
+    net: null,          // {ip, port_ok}
+    tunnel: { enabled: false, relay: 'wss://riki-api.online/ws', ok: null, skipped: false },
+    position: 'right',
+    group: cfg.group_id || '',
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const cfg = await invoke('get_config');
+  state.tunnel.relay = cfg.tunnel.relay;
+  state.position = cfg.position;
+  $('relay').value = cfg.tunnel.relay;
+  $('receiveDir').value = cfg.receive_dir || '';
+  $('devid').textContent = cfg.tunnel.device_id;
+  $('pairSecret').value = cfg.tunnel.shared_secret || '';
+  $('tunnelPeers').value = (cfg.known_tunnel_devices || []).join(', ');
+  $('tunEn').checked = false;
+  document.querySelectorAll('.poscard').forEach(c =>
+    c.classList.toggle('sel', c.dataset.side === cfg.position));
+
+  function show(n) {
+    cur = n;
+    document.querySelectorAll('.stepbox').forEach(s => s.classList.remove('show'));
+    $('s' + n).classList.add('show');
+    document.querySelectorAll('.dot').forEach(d =>
+      d.classList.toggle('on', +d.dataset.s <= n));
+    $('backBtn').style.visibility = n === 1 ? 'hidden' : 'visible';
+    $('nextBtn').style.visibility = n === 5 ? 'hidden' : 'visible';
+    if (n === 1 && !state.net) checkNet();
+    if (n === 5) summary();
+  }
+  window.go = show;
+  function next() { if (cur === 1 && !state.net) checkNet(); show(Math.min(5, cur + 1)); }
+  function back() { show(Math.max(1, cur - 1)); }
+  // These handlers are called by inline HTML attributes, so expose them from
+  // this module explicitly.  Module-scoped declarations are not globals.
+  window.next = next;
+  window.back = back;
+
+  async function checkNet() {
+    $('r1').innerHTML = 'checking…';
+    try {
+      state.net = await invoke('wizard_check_network');
+      $('r1').innerHTML =
+        `<span class="ok">✓</span> Connected — your LAN IP: <b>${state.net.ip}</b><br>` +
+        `<span class="ok">✓</span> receive port ${state.net.port_ok ? 'free and ready' : 'busy (will use next port)'}`;
+    } catch (e) {
+      $('r1').innerHTML = `<span class="bad">✗ ${e}</span>`;
+    }
+  }
+
+  window.pickSide = (s) => {
+    state.position = s;
+    document.querySelectorAll('.poscard').forEach(c =>
+      c.classList.toggle('sel', c.dataset.side === s));
+  };
+
+  $('tunEn').onchange = (e) => { state.tunnel.enabled = e.target.checked; };
+  $('relay').oninput = (e) => { state.tunnel.relay = e.target.value.trim(); };
+
+  window.testTunnel = async () => {
+    state.tunnel.enabled = $('tunEn').checked;
+    state.tunnel.relay = $('relay').value.trim();
+    if (!state.tunnel.enabled) {
+      $('r2').innerHTML = '<span class="dim">tunnel disabled — LAN only</span>';
+      state.tunnel.ok = true;
+      show(3);
+      return;
+    }
+    $('r2').innerHTML = '<span class="dim">connecting…</span>';
+    try {
+      const ids = await Promise.race([
+        invoke('wizard_check_tunnel', { relay: state.tunnel.relay, deviceId: cfg.tunnel.device_id }),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('relay test timed out after 15 seconds')), 15000))
+      ]);
+      state.tunnel.ok = true;
+      $('r2').innerHTML = `<span class="ok">✓ relay connected</span> — ${ids.length ? ids.length + ' device(s) currently cached' : 'device list will refresh after setup'}`;
+      show(3);
+    } catch (e) {
+      state.tunnel.ok = false;
+      $('r2').innerHTML = `<span class="bad">✗ ${e}</span><br><span class="dim">You can continue — LAN transfers still work.</span>`;
+    }
+  };
+
+  function summary() {
+    const mark = (ok) => ok ? '<span class="ok">✓</span>' : '<span class="bad">✗</span>';
+    $('sum').innerHTML =
+      `${mark(state.net)} &nbsp;Local network — ${state.net ? state.net.ip : 'unknown'}<br>` +
+      `${mark(state.tunnel.ok === true || state.tunnel.skipped)} &nbsp;Tunnel — ${state.tunnel.enabled ? 'enabled (' + state.tunnel.relay + ')' : 'disabled (LAN only)'}<br>` +
+      `${mark(true)} &nbsp;Group — <b>${state.group || '(ยังไม่ได้กรอก)'}</b><br>` +
+      `${mark(!state.tunnel.enabled || $('pairSecret').value.trim())} &nbsp;Tunnel encryption — ${state.tunnel.enabled ? ($('pairSecret').value.trim() ? 'end-to-end encrypted' : 'pairing passphrase required') : 'not applicable'}<br>` +
+      `${mark(true)} &nbsp;Drop zone — <b>${state.position}</b> edge<br>` +
+      `${mark(true)} &nbsp;Firewall — not required on macOS`;
+  }
+
+  window.finish = async () => {
+    const button = $('finishBtn');
+    button.disabled = true;
+    button.textContent = 'Saving…';
+    try {
+      if (state.tunnel.enabled && !$('pairSecret').value.trim()) {
+        throw new Error('enter the same pairing passphrase on every trusted tunnel device');
+      }
+      await invoke('wizard_finish', {
+        position: state.position,
+        tunnelEnabled: state.tunnel.enabled,
+        relay: state.tunnel.relay,
+        deviceId: cfg.tunnel.device_id,
+        sharedSecret: $('pairSecret').value,
+        knownTunnelDevices: $('tunnelPeers').value,
+        receiveDir: $('receiveDir').value.trim(),
+      });
+      dbg('wizard finished');
+      button.textContent = 'Saved';
+      $('r5').innerHTML =
+        '<span class="ok">✓ Congratulations — setup complete.</span><br>' +
+        '<span class="dim">WhisperDrop is now running. This window will close…</span>';
+      setTimeout(async () => {
+        try { await window.__TAURI__.webviewWindow.getCurrentWebviewWindow().close(); }
+        catch (_) { window.close(); }
+      }, 1800);
+    } catch (e) {
+      button.disabled = false;
+      button.textContent = 'Finish & Save';
+      $('r5').innerHTML = `<span class="bad">save failed: ${e}</span>`;
+    }
+  };
+
+  show(1);
+</script>
+</body>
+</html>

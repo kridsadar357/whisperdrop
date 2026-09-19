@@ -1,0 +1,95 @@
+name: release
+
+# Tag a version (git tag v0.3.0 && git push --tags) to build the `whisperdrop`
+# CLI/app for every platform, publish a GitHub release with checksums, and
+# refresh the Homebrew tap formula.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,      target: aarch64-apple-darwin,      ext: "" }
+          - { os: macos-13,      target: x86_64-apple-darwin,       ext: "" }
+          - { os: ubuntu-22.04,  target: x86_64-unknown-linux-gnu,  ext: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc,   ext: ".exe" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+      - name: Build
+        working-directory: cli
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          NAME="whisperdrop-${VERSION}-${{ matrix.target }}"
+          mkdir -p out/"$NAME"
+          cp "cli/target/${{ matrix.target }}/release/whisperdrop${{ matrix.ext }}" out/"$NAME"/
+          cp README.md out/"$NAME"/
+          cd out
+          if [[ "${{ matrix.ext }}" == ".exe" ]]; then
+            7z a -tzip "$NAME.zip" "$NAME" >/dev/null
+            sha256sum "$NAME.zip" > "$NAME.zip.sha256"
+          else
+            tar czf "$NAME.tar.gz" "$NAME"
+            shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+          fi
+          rm -rf "$NAME"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: out/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd out && cat *.sha256 > checksums.txt && cat checksums.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.tar.gz
+            out/*.zip
+            out/checksums.txt
+          generate_release_notes: true
+      - name: Update Homebrew tap
+        # needs a PAT with `contents: write` on the tap repo, stored as TAP_GITHUB_TOKEN
+        if: ${{ env.TAP_TOKEN != '' }}
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/${OWNER}/homebrew-whisperdrop.git" tap
+          scripts/gen-formula.sh "$OWNER" "$VERSION" out/checksums.txt > tap/Formula/whisperdrop.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/whisperdrop.rb
+          git commit -m "whisperdrop ${VERSION}" || exit 0
+          git push
