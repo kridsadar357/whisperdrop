@@ -42,10 +42,13 @@ fn cfg_snapshot() -> crate::config::Config {
 }
 
 /// `register` frame carrying this device's id and member token.
-fn register_frame(group: &str) -> Message {
+/// `listen` = this session receives transfer traffic (the app's receive
+/// loop); one-shot send/query sessions pass false so the relay never
+/// pushes other people's chunks at a socket nobody is reading.
+fn register_frame(group: &str, listen: bool) -> Message {
     let cfg = cfg_snapshot();
     Message::text(
-        json!({"type":"register","group":group,"id":cfg.tunnel.device_id,"token":cfg.tunnel.member_token}).to_string(),
+        json!({"type":"register","group":group,"id":cfg.tunnel.device_id,"token":cfg.tunnel.member_token,"listen":listen}).to_string(),
     )
 }
 
@@ -137,7 +140,7 @@ pub async fn group_join_status(relay: &str, group: &str, request_id: &str) -> Re
 pub async fn group_query(relay: &str, group: &str, frame: serde_json::Value, reply_types: &[&str]) -> Result<serde_json::Value, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    tx.send(register_frame(group, false)).await.map_err(|e| e.to_string())?;
     await_registered(&mut rx).await?;
     tx.send(Message::text(frame.to_string())).await.map_err(|e| e.to_string())?;
     await_type(&mut rx, reply_types, 10).await
@@ -196,7 +199,33 @@ static IN_SENT: AtomicU64 = AtomicU64::new(0);
 static IN_TOTAL: AtomicU64 = AtomicU64::new(1);
 static IN_NAME: Mutex<String> = Mutex::new(String::new());
 static IN_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+/// Open handle for the .part file (kept across chunks — reopening per
+/// chunk is slow, especially on Windows with real-time AV scanning).
+static IN_HANDLE: tokio::sync::Mutex<Option<tokio::fs::File>> = tokio::sync::Mutex::const_new(None);
+
+async fn part_write(bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let mut h = IN_HANDLE.lock().await;
+    if h.is_none() {
+        let path = IN_FILE.lock().unwrap().clone();
+        if let Some(p) = path {
+            *h = tokio::fs::OpenOptions::new().append(true).open(&p).await.ok();
+        }
+    }
+    if let Some(f) = h.as_mut() {
+        let _ = f.write_all(bytes).await;
+    }
+}
+
+async fn part_close() {
+    use tokio::io::AsyncWriteExt;
+    if let Some(mut f) = IN_HANDLE.lock().await.take() {
+        let _ = f.flush().await;
+    }
+}
 static IN_REPLY_TO: Mutex<String> = Mutex::new(String::new());
+/// Sender of the transfer currently being written (one at a time).
+static IN_FROM: Mutex<String> = Mutex::new(String::new());
 static IN_ENCRYPTED: AtomicBool = AtomicBool::new(false);
 static IN_FAILED: AtomicBool = AtomicBool::new(false);
 static IN_NONCE: Mutex<String> = Mutex::new(String::new());
@@ -422,7 +451,7 @@ pub async fn devices(relay: &str, self_id: &str) -> Result<Vec<String>, String> 
     if group.is_empty() {
         return Err("not in a group — run `whisperdrop group create` or `whisperdrop group join <id>`".into());
     }
-    tx.send(register_frame(&group)).await.map_err(|e| e.to_string())?;
+    tx.send(register_frame(&group, false)).await.map_err(|e| e.to_string())?;
     await_registered(&mut rx).await?;
     tx.send(Message::text(json!({"type":"devices"}).to_string()))
         .await
@@ -463,6 +492,9 @@ pub async fn send_over_tunnel(
 ) -> Result<u64, String> {
     match send_over_tunnel_once(relay, group, path).await {
         Ok(n) => Ok(n),
+        // re-sending after the receiver merely hasn't confirmed yet would
+        // collide with the transfer still being written on the other side
+        Err(e) if e.contains("confirm") || e.contains("passphrase") || e.contains("not a member") => Err(e),
         Err(e) => {
             tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
             send_over_tunnel_once(relay, group, path).await
@@ -479,7 +511,7 @@ async fn send_over_tunnel_once(
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
     let request_id = cfg_snapshot().tunnel.device_id;
-    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    tx.send(register_frame(group, false)).await.map_err(|e| e.to_string())?;
     await_registered(&mut rx).await?;
 
     let name = std::path::Path::new(path)
@@ -546,8 +578,11 @@ async fn send_over_tunnel_once(
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
-    // wait for the relay to flush (best-effort ack window)
-    let confirmation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+    // the receiver decrypts and writes as frames arrive; give a slow disk
+    // or link plenty of time to finish before calling it a failure
+    print!("  waiting for the receiver to confirm…");
+    let _ = std::io::stdout().flush();
+    let confirmation = tokio::time::timeout(std::time::Duration::from_secs(600), async {
         while let Some(message) = rx.next().await {
             let Message::Text(text) = message.map_err(|e| e.to_string())? else {
                 continue;
@@ -565,7 +600,8 @@ async fn send_over_tunnel_once(
         Err("relay disconnected before the target confirmed receipt".to_string())
     })
     .await
-    .map_err(|_| "target did not confirm receipt within 30 seconds".to_string())?;
+    .map_err(|_| "the receiver did not confirm receipt within 10 minutes".to_string())?;
+    print!("\r                                          \r");
     confirmation?;
     Ok(total as u64)
 }
@@ -586,7 +622,7 @@ pub async fn receive_loop(relay: String, self_id: String) {
             Ok((ws, _)) => {
                 println!("[tunnel] connected ✓");
                 let (mut tx, mut rx) = ws.split();
-                if tx.send(register_frame(&group)).await.is_err() {
+                if tx.send(register_frame(&group, true)).await.is_err() {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
@@ -680,6 +716,15 @@ async fn handle_frame(
         "begin" => {
             let name = v["name"].as_str().unwrap_or("file").to_string();
             let size = v["size"].as_u64().unwrap_or(0);
+            // one incoming transfer at a time: a different sender starting
+            // now would interleave its chunks into this file
+            let from = v["reply_to"].as_str().or_else(|| v["from"].as_str()).unwrap_or("").to_string();
+            let busy_with = IN_FROM.lock().unwrap().clone();
+            if IN_FILE.lock().unwrap().is_some() && !busy_with.is_empty() && busy_with != from {
+                let _ = tx.send(Message::text(json!({"type":"error","to":from,"from":"self","err":"receiver is busy with another transfer — try again in a moment"}).to_string())).await;
+                return;
+            }
+            *IN_FROM.lock().unwrap() = from;
             let encrypted = v["encrypted"].as_bool().unwrap_or(false);
             if encrypted && tunnel_key().is_none() {
                 let reply_to = v["reply_to"].as_str().unwrap_or("");
@@ -698,6 +743,7 @@ async fn handle_frame(
             IN_SENT.store(0, Ordering::Relaxed);
             IN_ENCRYPTED.store(encrypted, Ordering::Relaxed);
             IN_FAILED.store(false, Ordering::Relaxed);
+            part_close().await;
             // open the .part file the chunks append to
             let dir = crate::receive_dir();
             if let Err(e) = tokio::fs::create_dir_all(&dir).await {
@@ -714,6 +760,7 @@ async fn handle_frame(
                 Err(e) => {
                     eprintln!("[tunnel] cannot create {}: {e}", part.display());
                     *IN_FILE.lock().unwrap() = None;
+                IN_FROM.lock().unwrap().clear();
                 }
             }
         }
@@ -728,6 +775,7 @@ async fn handle_frame(
                         Err(err) => {
                             IN_FAILED.store(true, Ordering::Relaxed);
                             eprintln!("[tunnel] decrypt failed: {err} — aborting transfer");
+                            part_close().await;
                             let part = IN_FILE.lock().unwrap().take();
                             if let Some(p) = part {
                                 let _ = tokio::fs::remove_file(&p).await;
@@ -747,6 +795,7 @@ async fn handle_frame(
                         eprintln!(
                             "[tunnel] encrypted chunk without a pairing passphrase — aborting"
                         );
+                        part_close().await;
                         let part = IN_FILE.lock().unwrap().take();
                         if let Some(p) = part {
                             let _ = tokio::fs::remove_file(&p).await;
@@ -757,19 +806,14 @@ async fn handle_frame(
                 }
             }
             IN_SENT.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            let part_opt = IN_FILE.lock().unwrap().clone();
-            if let Some(p) = part_opt {
-                use tokio::io::AsyncWriteExt;
-                if let Ok(mut f) = tokio::fs::OpenOptions::new().append(true).open(&p).await {
-                    let _ = f.write_all(&bytes).await;
-                }
-            }
+            part_write(&bytes).await;
             crate::overlay::progress(
                 IN_SENT.load(Ordering::Relaxed),
                 IN_TOTAL.load(Ordering::Relaxed),
             );
         }
         "end" => {
+            part_close().await;
             let newname = IN_NAME.lock().unwrap().clone();
             let part_opt = IN_FILE.lock().unwrap().clone();
             if let Some(part) = part_opt {
@@ -780,6 +824,7 @@ async fn handle_frame(
                         let _ = tx.send(Message::text(json!({"type":"error","to":reply_to,"from":"tunnel-send","err":"decryption failed — passphrase does not match"}).to_string())).await;
                     }
                     *IN_FILE.lock().unwrap() = None;
+                IN_FROM.lock().unwrap().clear();
                     crate::overlay::finish();
                     return;
                 }
@@ -806,6 +851,7 @@ async fn handle_frame(
                     }
                 }
                 *IN_FILE.lock().unwrap() = None;
+                IN_FROM.lock().unwrap().clear();
             }
             crate::overlay::finish();
         }

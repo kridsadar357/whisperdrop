@@ -38,11 +38,13 @@ type Rx = futures_util::stream::SplitStream<
     WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
-/// `register` frame carrying this device's member token.
-fn register_frame(group: &str) -> Message {
+/// `register` frame carrying this device's member token. `listen` marks
+/// the app's receive loop; one-shot send/query sessions pass false so the
+/// relay never pushes transfer traffic at a socket nobody is reading.
+fn register_frame(group: &str, listen: bool) -> Message {
     let cfg = get_cfg();
     Message::text(
-        json!({"type":"register","group":group,"id":cfg.tunnel.device_id,"token":cfg.tunnel.member_token})
+        json!({"type":"register","group":group,"id":cfg.tunnel.device_id,"token":cfg.tunnel.member_token,"listen":listen})
             .to_string(),
     )
 }
@@ -89,10 +91,36 @@ static IN_SENT: AtomicU64 = AtomicU64::new(0);
 static IN_TOTAL: AtomicU64 = AtomicU64::new(1);
 static IN_NAME: Mutex<String> = Mutex::new(String::new());
 static IN_FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Open handle for the .part file (kept across chunks — reopening per
+/// chunk is slow, especially on Windows with real-time AV scanning).
+static IN_HANDLE: tokio::sync::Mutex<Option<tokio::fs::File>> = tokio::sync::Mutex::const_new(None);
+
+async fn part_write(bytes: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let mut h = IN_HANDLE.lock().await;
+    if h.is_none() {
+        let path = IN_FILE.lock().unwrap().clone();
+        if let Some(p) = path {
+            *h = tokio::fs::OpenOptions::new().append(true).open(&p).await.ok();
+        }
+    }
+    if let Some(f) = h.as_mut() {
+        let _ = f.write_all(bytes).await;
+    }
+}
+
+async fn part_close() {
+    use tokio::io::AsyncWriteExt;
+    if let Some(mut f) = IN_HANDLE.lock().await.take() {
+        let _ = f.flush().await;
+    }
+}
 static IN_FAILED: AtomicBool = AtomicBool::new(false);
 static IN_ENCRYPTED: AtomicBool = AtomicBool::new(false);
 static IN_NONCE: Mutex<String> = Mutex::new(String::new());
 static IN_REPLY_TO: Mutex<String> = Mutex::new(String::new());
+/// Sender of the transfer currently being written (one at a time).
+static IN_FROM: Mutex<String> = Mutex::new(String::new());
 
 const CHUNK: usize = 48 * 1024;
 const B64T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -254,7 +282,7 @@ pub async fn send_over_tunnel(
 ) -> Result<u64, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    tx.send(register_frame(group))
+    tx.send(register_frame(group, false))
         .await
         .map_err(|e| format!("register: {e}"))?;
     await_registered(&mut rx).await?;
@@ -306,9 +334,9 @@ pub async fn send_over_tunnel(
     .map_err(|e| format!("send end: {e}"))?;
 
     // wait for a receiver to confirm (or report a decrypt failure)
-    match await_type(&mut rx, &["complete"], 30).await {
+    match await_type(&mut rx, &["complete"], 600).await {
         Ok(_) => Ok(total),
-        Err(e) if e.starts_with("timed out") => Err("no device in the group confirmed receipt within 30 seconds".into()),
+        Err(e) if e.starts_with("timed out") => Err("no device in the group confirmed receipt within 10 minutes".into()),
         Err(e) => Err(e),
     }
 }
@@ -318,7 +346,7 @@ pub async fn send_over_tunnel(
 pub async fn devices(relay: &str, group: &str, self_id: &str) -> Result<Vec<String>, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    tx.send(register_frame(group, false)).await.map_err(|e| e.to_string())?;
     await_registered(&mut rx).await?;
     tx.send(Message::text(json!({"type":"devices"}).to_string()))
         .await
@@ -372,7 +400,7 @@ pub async fn receive_loop(relay: String, group: String, self_id: String, app: Ap
             Ok((ws, _)) => {
                 println!("[tunnel] connected ✓");
                 let (mut tx, mut rx) = ws.split();
-                if tx.send(register_frame(&group)).await.is_err() {
+                if tx.send(register_frame(&group, true)).await.is_err() {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                     continue;
                 }
@@ -505,7 +533,7 @@ pub async fn group_join_status(relay: &str, group: &str, request_id: &str) -> Re
 pub async fn group_query(relay: &str, group: &str, frame: serde_json::Value, reply_types: &[&str]) -> Result<serde_json::Value, String> {
     let (ws, _) = connect(relay).await?;
     let (mut tx, mut rx) = ws.split();
-    tx.send(register_frame(group)).await.map_err(|e| e.to_string())?;
+    tx.send(register_frame(group, false)).await.map_err(|e| e.to_string())?;
     await_registered(&mut rx).await?;
     tx.send(Message::text(frame.to_string())).await.map_err(|e| e.to_string())?;
     await_type(&mut rx, reply_types, 10).await
@@ -558,6 +586,15 @@ async fn handle_frame(
         "begin" => {
             let name = v["name"].as_str().unwrap_or("file").to_string();
             let size = v["size"].as_u64().unwrap_or(0);
+            // one incoming transfer at a time: a different sender starting
+            // now would interleave its chunks into this file
+            let from = v["reply_to"].as_str().or_else(|| v["from"].as_str()).unwrap_or("").to_string();
+            let busy_with = IN_FROM.lock().unwrap().clone();
+            if IN_FILE.lock().unwrap().is_some() && !busy_with.is_empty() && busy_with != from {
+                let _ = tx.send(Message::text(json!({"type":"error","to":from,"from":"self","err":"receiver is busy with another transfer — try again in a moment"}).to_string())).await;
+                return;
+            }
+            *IN_FROM.lock().unwrap() = from;
             *IN_NAME.lock().unwrap() = name.clone();
             IN_TOTAL.store(v["wire_size"].as_u64().unwrap_or(size).max(1), Ordering::Relaxed);
             IN_SENT.store(0, Ordering::Relaxed);
@@ -570,6 +607,7 @@ async fn handle_frame(
                 .unwrap_or("")
                 .to_string();
             IN_FAILED.store(false, Ordering::Relaxed);
+            part_close().await;
             let mut dir = crate::server::receive_dir();
             std::fs::create_dir_all(&dir).ok();
             dir.push(format!(".{name}.part"));
@@ -588,6 +626,7 @@ async fn handle_frame(
                         Err(err) => {
                             IN_FAILED.store(true, Ordering::Relaxed);
                             eprintln!("[tunnel] decrypt failed: {err} — aborting transfer");
+                            part_close().await;
                             let part = IN_FILE.lock().unwrap().take();
                             if let Some(p) = part {
                                 let _ = tokio::fs::remove_file(&p).await;
@@ -608,15 +647,10 @@ async fn handle_frame(
                 }
             }
             IN_SENT.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            let part_opt = IN_FILE.lock().unwrap().clone();
-            if let Some(p) = part_opt {
-                use tokio::io::AsyncWriteExt;
-                if let Ok(mut f) = tokio::fs::OpenOptions::new().append(true).open(&p).await {
-                    let _ = f.write_all(&bytes).await;
-                }
-            }
+            part_write(&bytes).await;
         }
         "end" => {
+            part_close().await;
             let newname = IN_NAME.lock().unwrap().clone();
             let failed = IN_FAILED.swap(false, Ordering::Relaxed);
             let part_opt = IN_FILE.lock().unwrap().clone();
@@ -643,6 +677,7 @@ async fn handle_frame(
                     }
                 }
                 *IN_FILE.lock().unwrap() = None;
+                IN_FROM.lock().unwrap().clear();
             }
         }
         _ => {}

@@ -14,7 +14,8 @@
 //!                                                    then join_result {request_id, approved, token?}
 //!   join_status  {group, request_id}             -> join_result | join_pending
 //!   ping                                         -> pong
-//!   register     {group, id, token}              -> registered {role, members:[..]} | error
+//!   register     {group, id, token, listen?}     -> registered {role, members:[..]} | error
+//!                (listen=false: send-only session, receives only frames addressed "to" it)
 //! After register (member):
 //!   devices                                      -> devices {ids:[online ids]}
 //!   members                                      -> members {members:[{device_id,name,role,online}]}
@@ -127,15 +128,25 @@ fn request_id() -> String {
 }
 
 // -------------------------------------------------------------- live state
+/// Per-connection outbound queue. Bounded so a slow receiver applies
+/// backpressure to the sender instead of filling the relay's memory
+/// with a whole file; ~256 chunk frames ≈ 3 MB in flight per member.
+type OutTx = tokio::sync::mpsc::Sender<Message>;
+const QUEUE: usize = 256;
+
 #[derive(Clone)]
 struct Conn {
     device_id: String,
     role: String,
-    tx: tokio::sync::mpsc::UnboundedSender<Message>,
+    /// receives transfer traffic (an app's receive loop). Send-only
+    /// sessions (`register` with `"listen": false`) never do — they only
+    /// read their socket after uploading, so pushing to them would stall.
+    listen: bool,
+    tx: OutTx,
 }
 
 /// waiting join requesters: request id -> their outbound channel
-type Waiters = HashMap<String, tokio::sync::mpsc::UnboundedSender<Message>>;
+type Waiters = HashMap<String, OutTx>;
 
 struct State {
     registry: Registry,
@@ -164,6 +175,23 @@ impl State {
             .map(|m| {
                 m.iter()
                     .filter(|(k, _)| **k != exclude)
+                    .map(|(_, c)| c.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// Where a transfer frame goes: addressed frames (`to`) reach every
+    /// session of that device; broadcast frames reach the *listening*
+    /// sessions of every other device (never the sender's own sessions).
+    fn targets(&self, group: &str, sender: &str, sender_key: u64, to: Option<&str>) -> Vec<Conn> {
+        self.online
+            .get(group)
+            .map(|m| {
+                m.iter()
+                    .filter(|(k, c)| **k != sender_key && match to {
+                        Some(dev) => c.device_id == dev,
+                        None => c.listen && c.device_id != sender,
+                    })
                     .map(|(_, c)| c.clone())
                     .collect()
             })
@@ -220,13 +248,14 @@ fn pending_frame(group: &str, id: &str, p: &Pending) -> serde_json::Value {
 async fn handle_client(shared: Shared, raw: TcpStream) {
     let Ok(ws) = tokio_tungstenite::accept_async(raw).await else { return };
     let (mut sink, mut stream) = ws.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(QUEUE);
 
     // ---- first frame decides what this connection is ----
     let Some(Ok(Message::Text(first))) = stream.next().await else { return };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&first) else { return };
     let s = |k: &str| v[k].as_str().unwrap_or("").trim().to_string();
 
+    let listen = v["listen"].as_bool().unwrap_or(true);
     let (group, device_id, role, key) = match v["type"].as_str() {
         Some("create_group") => {
             let (device_id, name) = (s("device_id"), s("device_name"));
@@ -267,7 +296,7 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
             let _ = sink.send(text(json!({"type": "join_pending", "request_id": rid, "group": group}))).await;
             let frame = pending_frame(&group, &rid, &Pending { device_id, name, ts: now(), result: None });
             for h in heads {
-                let _ = h.tx.send(text(frame.clone()));
+                let _ = h.tx.send(text(frame.clone())).await;
             }
             // keep the socket open until the head decides or the client leaves
             loop {
@@ -333,7 +362,7 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
     // ---- registered member session ----
     let (members, pending): (serde_json::Value, Vec<serde_json::Value>) = {
         let mut st = shared.lock().await;
-        st.online.entry(group.clone()).or_default().insert(key, Conn { device_id: device_id.clone(), role: role.clone(), tx: tx.clone() });
+        st.online.entry(group.clone()).or_default().insert(key, Conn { device_id: device_id.clone(), role: role.clone(), listen, tx: tx.clone() });
         let members = st.members_json(&group);
         let pending = if role == "head" {
             st.registry
@@ -346,7 +375,7 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
         };
         (members, pending)
     };
-    println!("[+] {device_id} ({role}) online in group {group}");
+    println!("[+] {device_id} ({role}{}) online in group {group}", if listen { "" } else { ", send-only" });
     if sink.send(text(json!({"type": "registered", "role": role, "members": members}))).await.is_err() {
         return;
     }
@@ -354,9 +383,20 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
         let _ = sink.send(text(p)).await;
     }
 
+    // Writer: drains this connection's queue into the socket on its own
+    // task, so a reader blocked on a full peer queue never stops its own
+    // outbound traffic (no two-way deadlock between simultaneous senders).
+    let writer = tokio::spawn(async move {
+        while let Some(m) = rx.recv().await {
+            if sink.send(m).await.is_err() {
+                break;
+            }
+        }
+    });
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(15));
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = std::time::Instant::now();
+    let reply_tx = tx.clone();
     loop {
         tokio::select! {
             _ = ping.tick() => {
@@ -364,14 +404,10 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
                     println!("[!] {device_id} stale — dropping");
                     break;
                 }
-                if sink.send(Message::Ping(Vec::new())).await.is_err() {
+                if reply_tx.send(Message::Ping(Vec::new())).await.is_err() {
                     break;
                 }
             }
-            msg = rx.recv() => match msg {
-                Some(m) => { if sink.send(m).await.is_err() { break; } }
-                None => break,
-            },
             read = stream.next() => match read {
                 Some(Ok(Message::Text(t))) => {
                     last_seen = std::time::Instant::now();
@@ -392,7 +428,7 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
                                 g.members.retain(|_, m| m.device_id != device_id);
                             }
                             st.persist();
-                            let _ = sink.send(text(json!({"type": "ok"}))).await;
+                            let _ = reply_tx.send(text(json!({"type": "ok"}))).await;
                             break;
                         }
                         Some("pending") if role == "head" => {
@@ -420,12 +456,15 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
                                 Some((who, tok)) => {
                                     st.persist();
                                     println!("[group] {group}: {who} {}", if approved { "approved" } else { "denied" });
-                                    if let Some(w) = st.waiters.get(&rid) {
-                                        let _ = w.send(text(json!({"type": "join_result", "request_id": rid, "approved": approved, "token": tok})));
+                                    let waiter = st.waiters.get(&rid).cloned();
+                                    let heads = st.heads(&group);
+                                    drop(st);
+                                    if let Some(w) = waiter {
+                                        let _ = w.send(text(json!({"type": "join_result", "request_id": rid, "approved": approved, "token": tok}))).await;
                                     }
                                     // other head devices should drop the card too
-                                    for h in st.heads(&group) {
-                                        let _ = h.tx.send(text(json!({"type": "join_decided", "request_id": rid, "approved": approved})));
+                                    for h in heads {
+                                        let _ = h.tx.send(text(json!({"type": "join_decided", "request_id": rid, "approved": approved}))).await;
                                     }
                                     Some(json!({"type": "ok", "request_id": rid}))
                                 }
@@ -439,26 +478,29 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
                                 g.members.retain(|_, m| m.device_id != who || m.role == "head");
                             }
                             st.persist();
-                            for c in st.others(&group, key) {
-                                if c.device_id == who {
-                                    let _ = c.tx.send(err("removed from the group by its head"));
-                                    let _ = c.tx.send(Message::Close(None));
-                                }
+                            let victims: Vec<Conn> = st.others(&group, key).into_iter().filter(|c| c.device_id == who).collect();
+                            drop(st);
+                            for c in victims {
+                                let _ = c.tx.send(err("removed from the group by its head")).await;
+                                let _ = c.tx.send(Message::Close(None)).await;
                             }
                             Some(json!({"type": "ok"}))
                         }
                         Some("pending") | Some("approve") | Some("kick") => Some(json!({"type": "error", "err": "only the group head can do that"})),
                         _ => {
-                            // transfer frame: deliver to every other online member
-                            let st = shared.lock().await;
-                            for c in st.others(&group, key) {
-                                let _ = c.tx.send(Message::text(t.clone()));
+                            // transfer frame: deliver to every other online *device*
+                            // (never back to the sender's own receive session);
+                            // awaiting a full queue is the backpressure
+                            let to = v["to"].as_str().map(str::to_string);
+                            let targets = shared.lock().await.targets(&group, &device_id, key, to.as_deref());
+                            for c in targets {
+                                let _ = c.tx.send(Message::text(t.clone())).await;
                             }
                             None
                         }
                     };
                     if let Some(r) = reply {
-                        if sink.send(text(r)).await.is_err() {
+                        if reply_tx.send(text(r)).await.is_err() {
                             break;
                         }
                     }
@@ -478,6 +520,9 @@ async fn handle_client(shared: Shared, raw: TcpStream) {
             }
         }
     }
+    drop(reply_tx);
+    drop(tx);
+    writer.abort();
     println!("[-] {device_id} offline (group {group})");
 }
 
