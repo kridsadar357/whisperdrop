@@ -17,8 +17,9 @@ static SENT: AtomicU64 = AtomicU64::new(0);
 static TOTAL: AtomicU64 = AtomicU64::new(1);
 static FILENAME: Mutex<String> = Mutex::new(String::new());
 
+/// `total` = expected bytes, or 0 when the sender did not say.
 pub fn begin(filename: &str, total: u64) {
-    TOTAL.store(total.max(1), Ordering::Relaxed);
+    TOTAL.store(total, Ordering::Relaxed);
     SENT.store(0, Ordering::Relaxed);
     FINISH_MS.store(0, Ordering::Relaxed);
     *FILENAME.lock().unwrap() = filename.to_string();
@@ -28,7 +29,7 @@ pub fn begin(filename: &str, total: u64) {
 
 pub fn progress(sent: u64, total: u64) {
     SENT.store(sent, Ordering::Relaxed);
-    TOTAL.store(total.max(1), Ordering::Relaxed);
+    TOTAL.store(total, Ordering::Relaxed);
 }
 
 pub fn finish() {
@@ -407,9 +408,12 @@ mod win {
 
         let sent = SENT.load(Ordering::Relaxed);
         let total = TOTAL.load(Ordering::Relaxed);
-        let pct = ((sent as f64 / total as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0);
+        // unknown size: the bar fills only when the transfer is done
+        let pct = if total == 0 {
+            if done { 100.0 } else { 0.0 }
+        } else {
+            ((sent as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0)
+        };
 
         // ---- pixel buffer ----
         let mut frame = Frame::new();
@@ -712,12 +716,13 @@ mod win {
         let done = FINISH_MS.load(Ordering::Relaxed) != 0;
         let sent = SENT.load(Ordering::Relaxed);
         let total = TOTAL.load(Ordering::Relaxed);
-        let pct = ((sent as f64 / total as f64) * 100.0)
-            .round()
-            .clamp(0.0, 100.0) as i64;
         let label = if done {
             "Done ✓".to_string()
+        } else if total == 0 {
+            // size unknown — show what has arrived so far
+            format!("{:.0} MB", sent as f64 / 1_048_576.0)
         } else {
+            let pct = ((sent as f64 / total as f64) * 100.0).round().clamp(0.0, 100.0) as i64;
             format!("{}%", pct)
         };
         let pct_font: HFONT = CreateFontW(

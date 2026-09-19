@@ -147,6 +147,7 @@ fn unique_path(dir: &std::path::Path, filename: &str) -> PathBuf {
 
 async fn upload(
     Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
     stream: Body,
 ) -> Result<(StatusCode, String), (StatusCode, String)> {
     println!("→ incoming upload: {:?}", params.get("filename"));
@@ -167,7 +168,13 @@ async fn upload(
     let mut file = tokio::fs::File::create(&dest)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let total = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    // Expected size comes from the sender's Content-Length (streamed
+    // uploads); without it the overlay shows an indeterminate bar.
+    let total = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     overlay::begin(&filename, total);
     let mut stream = stream.into_data_stream();
     let mut written: u64 = 0;
