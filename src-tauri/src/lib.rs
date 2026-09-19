@@ -269,7 +269,7 @@ async fn wizard_check_network() -> Result<serde_json::Value, String> {
     let ip = tokio::time::timeout(std::time::Duration::from_secs(5), probe)
         .await
         .map_err(|e| format!("timeout: {e}"))?
-        .map_err(|e| format!("join: {e}"))?;
+        .map_err(|e| format!("join: {e}"))??; // inner Result: the probe's own error
     let mut port_ok = false;
     for port in [51731u16, 51730] {
         if tokio::net::TcpListener::bind(("0.0.0.0", port))
