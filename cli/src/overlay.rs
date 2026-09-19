@@ -154,6 +154,7 @@ mod win {
 
     extern "system" {
         fn GetModuleHandleW(name: LPCWSTR) -> HINSTANCE;
+        fn LoadCursorW(inst: HINSTANCE, name: LPCWSTR) -> HCURSOR;
         fn RegisterClassW(class: *const WNDCLASSW) -> u16;
         fn CreateWindowExW(
             ex_style: u32,
@@ -842,7 +843,7 @@ mod win {
                     cb_wnd_extra: 0,
                     h_instance: GetModuleHandleW(std::ptr::null()),
                     h_icon: 0,
-                    h_cursor: 0,
+                    h_cursor: LoadCursorW(0, 32512 as LPCWSTR), // IDC_ARROW
                     h_br_background: 0,
                     lpsz_menu_name: std::ptr::null(),
                     lpsz_class_name: class_name.as_ptr(),

@@ -80,6 +80,7 @@ mod imp {
         fn SetForegroundWindow(hwnd: HWND) -> BOOL;
         fn PostMessageW(hwnd: HWND, msg: UINT, w: usize, l: isize) -> BOOL;
         fn GetModuleHandleW(name: *const u16) -> isize;
+        fn LoadCursorW(inst: isize, name: *const u16) -> isize;
     }
     #[link(name = "gdi32")]
     extern "system" {
@@ -1060,7 +1061,7 @@ mod imp {
                         extra_win: 0,
                         instance: GetModuleHandleW(std::ptr::null()),
                         icon: 0,
-                        cursor: 0,
+                        cursor: LoadCursorW(0, 32512 as *const u16), // IDC_ARROW
                         background: 0,
                         menu: std::ptr::null(),
                         class_name: class_name.as_ptr(),

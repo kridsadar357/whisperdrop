@@ -533,8 +533,11 @@ mod firewall {
             .unwrap_or(false)
     }
 
+    /// Does an allow rule with our name exist *for this exe path*? A rule
+    /// left behind by an older/moved binary matches by name but does not
+    /// cover the current program, so inbound mDNS/TCP would still be blocked.
     pub(crate) fn rule_exists() -> bool {
-        run_quiet(
+        let out = run_quiet(
             "netsh",
             &[
                 "advfirewall",
@@ -542,10 +545,23 @@ mod firewall {
                 "show",
                 "rule",
                 &format!("name={RULE_NAME}"),
+                "verbose",
             ],
         )
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(RULE_NAME))
-        .unwrap_or(false)
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+        if !out.contains(RULE_NAME) {
+            return false;
+        }
+        // verbose output lists "Program: <path>" for each rule
+        out.to_lowercase().contains(&current_exe().to_lowercase())
+    }
+
+    fn delete_rule_elevated() {
+        let _ = run_quiet(
+            "netsh",
+            &["advfirewall", "firewall", "delete", "rule", &format!("name={RULE_NAME}")],
+        );
     }
 
     /// Add an inbound allow rule scoped to this exe (covers TCP 51730+ and
@@ -581,6 +597,7 @@ mod firewall {
         }
         println!("[firewall] asking Windows for permission (UAC prompt)…");
         if is_elevated() {
+            delete_rule_elevated();
             let ok = add_rule_elevated();
             println!(
                 "[firewall] {}",
@@ -614,6 +631,8 @@ mod firewall {
 
     /// Entry point when relaunched elevated for setup.
     pub fn setup_and_exit() -> ! {
+        // replace any stale rule (old exe name / location) with one for this exe
+        delete_rule_elevated();
         let ok = add_rule_elevated();
         println!(
             "[firewall] {}",
